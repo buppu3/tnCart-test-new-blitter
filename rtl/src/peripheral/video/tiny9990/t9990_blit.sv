@@ -33,13 +33,6 @@
 
 `default_nettype none
 
-// POINT, PSET, ADVANCE, LINE, SEARCH のテストはまだ
-`define ENABLE_POINT
-`define ENABLE_PSET
-`define ENABLE_ADVANCE
-`define ENABLE_LINE
-`define ENABLE_SRCH
-
 /***************************************************************
  * VDP コマンド
  ***************************************************************/
@@ -57,848 +50,465 @@ module T9990_BLIT (
     // CONTROL
     input wire                  START          // 開始
 );
+    wire cond_dst_write_req       = xfer_run && ena_output && !io_req;                          // DST 書き出し要求の条件
+    wire cond_dst_write_even_done = xfer_run && ena_output && io_req && io_ack && p1_even;      // DST (P1 偶数)の書き出し完了の条件
+    wire cond_dst_write_done      = xfer_run && ena_output && io_req && io_ack && !p1_even;     // DST 書き出し完了の条件
 
-`ifndef ENABLE_SRCH
-    assign STATUS.BD = 0;
-    assign STATUS.BX = 0;
-`endif
+    wire cond_dst_read_req        = xfer_run && ena_dequeue && !io_req;                         // DST 読み出し要求の条件
+    wire cond_dst_read_even_done  = xfer_run && ena_dequeue && io_req && io_ack && p1_even;     // DST (P1 偶数)の読み出し完了の条件
+    wire cond_dst_read_done       = xfer_run && ena_dequeue && io_req && io_ack && !p1_even;    // DST の読み出し完了の条件
 
-    reg src_is_cpu;
-    reg src_is_linear;
-    reg src_is_xy;
-    reg src_is_vdp;
-    reg src_is_rom;
-    reg src_is_char;
-    reg dst_is_cpu;
-    reg dst_is_linear;
-    reg dst_is_xy;
+    wire cond_src_read_req        = xfer_run && ena_enqueue && !io_req;                         // SRC 読み出し要求の条件
+    wire cond_src_read_even_done  = xfer_run && ena_enqueue && io_req && io_ack &&  p1_even;    // SRC (P1 偶数)の読み出し完了の条件
+    wire cond_src_read_done       = xfer_run && ena_enqueue && io_req && io_ack && !p1_even;    // SRC の読み出し完了の条件
 
-    // CHAR 用ワーク構造体
-    typedef struct {
-        reg [5:0] decode_count;
-        reg [31:0] decode_data;
-    } char_work_t;
+    wire cond_src_dequeue_req     = xfer_run && ena_dequeue && !io_req;                         // FIFO 取り出し要求の条件
+    wire cond_logop               = xfer_run && ena_logop;                                      // ロジカルオペレーション要求の条件
 
-    // LINE 用ワーク構造体
-    typedef struct {
-        reg [11:0]   cnt;       // ループ回数
-        reg [11+1:0] sum;       // DDA 用
-    } line_work_t;
-
-    // SEARCH 用ワーク構造体
-    typedef struct {
-        reg clr_neq;            // 色データ不一致
-        reg edge_left;          // 左端検出
-        reg edge_right;         // 右端検出
-    } srch_work_t;
-wire srch_clr_neq = work.srch.clr_neq;
-wire srch_edge_left = work.srch.edge_left;
-wire srch_edge_right = work.srch.edge_left;
-
-    // LINE / SEARCH 用ワーク
-    union {
-        char_work_t char;
-        line_work_t line;
-        srch_work_t srch;
-    } work;
-
-    reg is_line;                // LINE コマンド実行中
-    reg is_srch;                // SEARCH コマンド実行中
-    reg is_point;               // POINT コマンド実行中
-    reg req_dst_vram;           // DST 読み出し要求
-    reg src_enable;             // SRC 読み出し許可
-
-    reg [1:0]  XIMM;
-    reg [1:0]  SRC_CLRM;
-    reg [18:0] SRC_X;
-    reg [18:0] SRC_NX;
-    reg [11:0] SRC_Y;
-    reg [11:0] SRC_NY;
-    reg        SRC_DIX;
-    reg [1:0]  DST_CLRM;
-    reg [18:0] DST_X;
-    reg [18:0] DST_NX;
-    reg [11:0] DST_Y;
-    reg [11:0] DST_NY;
-    reg        DST_DIX;
-
-    reg [31:0] SRC_DATA;
-    reg [31:0] DST_DATA;
-    reg [31:0] WRT_DATA;
-
-    reg FIFO_CLEAR;
-    reg ENQUEUE;
-    reg [4:0] ENQUEUE_COUNT;
-    reg [3:0] ENQUEUE_SHIFT;
-    reg [31:0] ENQUEUE_DATA;
-    reg DEQUEUE;
-    reg [4:0] DEQUEUE_COUNT;
-    reg [3:0] DEQUEUE_SHIFT;
-    wire [31:0] DEQUEUE_DATA;
-    wire [5:0] FREE_COUNT;
-    wire [5:0] AVAIL_COUNT;
-    T9990_BLIT_FIFO u_fifo (
-        .RESET_n,
-        .CLK,
-        .CLK_EN,
-        .CLRM(SRC_CLRM),
-        .FREE_COUNT,
-        .AVAIL_COUNT,
-        .CLEAR(FIFO_CLEAR),
-        .ENQUEUE,
-        .ENQUEUE_COUNT,
-//        .ENQUEUE_SHIFT,
-        .ENQUEUE_DATA,
-        .DEQUEUE,
-        .DEQUEUE_COUNT,
-        .DEQUEUE_SHIFT,
-        .DEQUEUE_DATA
-    );
-
-    reg [18:0] SRC_XY_ADDR;
-    T9990_BLIT_ADDR u_src_addr (
-        .CLK,
-        .CLRM(SRC_CLRM),
-        .P1,
-        .XIMM,
-        .X(SRC_X[10:0]),
-        .Y(SRC_Y),
-        .ADDR(SRC_XY_ADDR)
-    );
-
-    reg [18:0] DST_XY_ADDR;
-    T9990_BLIT_ADDR u_dst_addr (
-        .CLK,
-        .CLRM(DST_CLRM),
-        .P1,
-        .XIMM,
-        .X(DST_X[10:0]),
-        .Y(DST_Y),
-        .ADDR(DST_XY_ADDR)
-    );
-
-    reg [4:0] SRC_COUNT;
-    T9990_BLIT_CALC_COUNT u_src_cnt (
-        .CLK,
-        .CPU_MODE(src_is_cpu),
-        .IS_POINT(is_point || is_srch),
-        .CLRM(SRC_CLRM),
-        .DIX(SRC_DIX),
-        .OFFSET(SRC_X[3:0]),
-        .REMAIN(SRC_NX),
-        .COUNT(SRC_COUNT)
-    );
-
-    reg [4:0] DST_COUNT;
-    T9990_BLIT_CALC_COUNT u_dst_cnt (
-        .CLK,
-        .CPU_MODE(dst_is_cpu),
-        .IS_POINT(is_point || is_srch),
-        .CLRM(DST_CLRM),
-        .DIX(DST_DIX),
-        .OFFSET(DST_X[3:0]),
-        .REMAIN(DST_NX),
-        .COUNT(DST_COUNT)
-    );
-
-    // 転送先座標からビットマスクを計算
-    reg [31:0] BIT_MASK;
-    T9990_BLIT_BITMASK u_bitmsk (
-        .CLK,
-        .WM(REG.WM),
-        .CLRM(DST_CLRM),
-        .DIX(DST_DIX),
-        .OFFSET(DST_X[3:0]),
-        .COUNT(DST_COUNT),
-        .BIT_MASK(BIT_MASK)
-    );
-
-    // P1 モード検出
+    /*******************************************
+     * P1 モード
+     *******************************************/
     reg P1;
 
-    // ENQUEUE 可能か？
-    reg ena_enqueue;
-    always_ff @(posedge CLK) if(CLK_EN) ena_enqueue <= FREE_COUNT >= SRC_OUT_COUNT && src_enable;
+    always_ff @(posedge CLK) begin
+        if(REG.DSPM[1]) begin
+            P1 <= 0;
+        end
+        else if(REG.DSPM[0]) begin
+            P1 <= 0;
+        end
+        else begin
+            P1 <= 1;
+        end
+    end
 
-    reg [15:0] save_mem_dout;       // P1 モード VRAM0 データ一時保存用
+    /*******************************************
+     * 横幅
+     *******************************************/
+    reg [1:0] XIMM;
 
-    wire [31:0] src_data_le = {SRC_DATA[7:0], SRC_DATA[15:8], SRC_DATA[23:16], SRC_DATA[31:24]};        // ロジカルオペレーション SRC データ(リトルエンディアン)
-    wire [31:0] bit_mask_le = {BIT_MASK[7:0], BIT_MASK[15:8], BIT_MASK[23:16], BIT_MASK[31:24]};        // ビットマスク(リトルエンディアン)
-    wire [31:0] masked_src_data_le = src_data_le & bit_mask_le;                                         // ビットマスク後の SRC データ(リトルエンディアン)
+    always_ff @(posedge CLK) begin
+        if(REG.DSPM[1]) begin
+            XIMM <= REG.XIMM;
+        end
+        else if(REG.DSPM[0]) begin
+            XIMM <= T9990_REG::XIMM_512;
+        end
+        else begin
+            XIMM <= T9990_REG::XIMM_256;
+        end
+    end
 
-    wire [31:0] cmd_mem_dout_p1_be  = { save_mem_dout[7:0], CMD_MEM.DOUT[7:0], save_mem_dout[15:8], CMD_MEM.DOUT[15:8]};    // 転送元 VRAM 読み出しデータ(P1モード、ビッグエンディアン)
-    wire [31:0] cmd_mem_dout_np1_be = { CMD_MEM.DOUT[7:0], CMD_MEM.DOUT[15:8], CMD_MEM.DOUT[23:16], CMD_MEM.DOUT[31:24]};   // 転送元 VRAM 読み出しデータ(ビッグエンディアン)
-    wire [31:0] cmd_mem_dout_be  = P1 ? cmd_mem_dout_p1_be : cmd_mem_dout_np1_be;                                           // 転送元 VRAM 読み出しデータ
+    /*******************************************
+     * 繰り返しコマンドフラグ
+     *******************************************/
+    reg command_is_loop;
+    reg command_is_line;
+    reg command_is_srch;
+
+    always_ff @(posedge CLK) begin
+        command_is_loop <= (REG.OP == T9990_REG::CMD_LINE) || (REG.OP == T9990_REG::CMD_SRCH);
+
+        command_is_line  <= (REG.OP == T9990_REG::CMD_LINE);
+        command_is_srch  <= (REG.OP == T9990_REG::CMD_SRCH);
+    end
+
+    /*******************************************
+     * POINT 動作フラグ
+     *******************************************/
+    reg is_point;
+    always_ff @(posedge CLK) is_point <= (REG.OP == T9990_REG::CMD_POINT) || (REG.OP == T9990_REG::CMD_SRCH);   // POINT と SEARCH はピクセルデータ取得
+
+    /*******************************************
+     * SETUP
+     *******************************************/
+    wire xfer_is_busy = (xfer_setup != 0) || xfer_run;                      // 転送ビジーフラグ
+    wire xfer_is_complete = STATUS.CE && !xfer_is_busy;                     // 転送完了フラグ
+    wire command_is_complete = xfer_is_complete && !is_continuous;          // コマンド完了
+    wire command_is_continue = xfer_is_complete &&  is_continuous;          // コマンド継続
+
+    reg [2:0]                    xfer_setup;                                                        // セットアップフラグ
+    wire [$bits(xfer_setup)-1:0] setup_start_value = 1 << ($bits(xfer_setup)-1);                    // 開始時の値
+    wire [$bits(xfer_setup)-1:0] setup_shift_value = { 1'b0, xfer_setup[$bits(xfer_setup)-1:1] };   // 次の値
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                            xfer_setup <= 0;                    // RESET
+        else if(!CLK_EN)                        ;                                   // タイミング外
+        else if(START || command_is_continue)   xfer_setup <= setup_start_value;    // 転送開始/転送再開
+        else                                    xfer_setup <= setup_shift_value;    // 転送中/転送終了
+    end
+
+    /*******************************************
+     * 転送完了後に処理を継続するか？
+     *******************************************/
+    reg is_continuous;                      // 処理継続フラグ
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                            is_continuous <= 0;                     // RESET
+        else if(!CLK_EN)                        ;                                       // タイミング外
+        else if(REG.OP == T9990_REG::CMD_STOP)  is_continuous <= 0;                     // STOP
+        else if(!command_is_loop)               is_continuous <= 0;                     // ループするコマンドではない
+        else if(START)                          is_continuous <= 1;                     // コマンド開始
+        else if(command_is_line)                is_continuous <= line_is_continuous;    // LINE 転送完了
+        else if(command_is_srch)                is_continuous <= srch_is_continuous;    // SEARCH 転送完了
+        else                                    is_continuous <= 0;                     // そのほか
+    end
+
+    /*******************************************
+     * LINE ループ
+     *******************************************/
+    // LINE 用ワーク構造体
+    struct {
+        reg [11:0]   count;                     // ループ回数
+        reg [11+1:0] acc;                       // DDA 用
+        reg [11+1:0] acc_next;                  // sum の次回の値
+        reg [11+1:0] acc_next_mod;              // sum の次回の値(Modulo)
+        reg          continuous;
+    } line_work;
+
+    // LINE コマンドの継続条件
+    wire line_is_continuous = line_work.continuous;
+
+    // 計算
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_line) begin
+            line_work.acc_next_mod <= line_work.acc_next + REG.MJ;
+            line_work.acc_next <= line_work.acc - REG.MI;
+        end
+    end
+
+    // 繰り返し回数
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_line) begin
+            if(START)                 line_work.count <= 1'd1;
+            else if(xfer_is_complete) line_work.count <= line_work.count - 1'd1;
+        end
+    end
+
+    // 繰り返しチェック
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_line) begin
+            line_work.continuous <= START ? 1 : (line_work.count != 1'd1);
+        end
+    end
+
+    // DDA
+    wire line_dda_trig = line_work.acc_next[$bits(line_work.acc_next)-1];
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_line) begin
+            if(START)                 line_work.acc <= REG.MJ - 1'd1;
+            else if(xfer_is_complete) line_work.acc <= line_dda_trig ? line_work.acc_next_mod : line_work.acc_next;
+        end
+    end
+
+    /*******************************************
+     * SEARCH ループ
+     *******************************************/
+    // SEARCH 用ワーク構造体
+    struct {
+        reg        clr_neq; // 色データ不一致
+        reg        no_edge; // 端検出
+        reg [10:0] sx;      // 取得した X 座標
+    } srch_work;
+
+    // SEARCH コマンドの継続条件
+    wire srch_is_continuous = srch_work.no_edge && !srch_found;
+
+    // 色の比較
+    wire srch_found = (REG.NEQ == srch_work.clr_neq);
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_srch) begin
+            if(START) srch_work.clr_neq <= 1;
+            else      srch_work.clr_neq <= ((SRC_DATA ^ {REG.FC,REG.FC}) & BIT_MASK) != 32'd0;
+        end
+    end
+
+    // 画面端検出
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_srch) begin
+            if(START) begin
+                srch_work.no_edge <= 1;
+            end
+            else begin
+                if(REG.DIX) begin
+                    case(XIMM)
+                        T9990_REG::XIMM_256:    srch_work.no_edge <= SRC_X[ 7:0] != 0;
+                        T9990_REG::XIMM_512:    srch_work.no_edge <= SRC_X[ 8:0] != 0;
+                        T9990_REG::XIMM_1024:   srch_work.no_edge <= SRC_X[ 9:0] != 0;
+                        default:                srch_work.no_edge <= SRC_X[10:0] != 0;
+                    endcase
+                end
+                else begin
+                    case(XIMM)
+                        T9990_REG::XIMM_256:    srch_work.no_edge <= SRC_X[ 7:0] !=      8'b1111_1111;
+                        T9990_REG::XIMM_512:    srch_work.no_edge <= SRC_X[ 8:0] !=    9'b1_1111_1111;
+                        T9990_REG::XIMM_1024:   srch_work.no_edge <= SRC_X[ 9:0] !=  10'b11_1111_1111;
+                        default:                srch_work.no_edge <= SRC_X[10:0] != 11'b111_1111_1111;
+                    endcase
+                end
+            end
+        end
+    end
+
+    // 結果
+    always_ff @(posedge CLK) begin
+        if(CLK_EN && command_is_srch) begin
+            if(START && command_is_srch) begin
+                STATUS.BD <= 0;
+                srch_work.sx <= REG.SX;
+            end
+            else if(xfer_is_complete) begin
+                if(!srch_is_continuous) begin
+                    STATUS.BX <= srch_work.sx;
+                    STATUS.BD <= srch_found;
+                end
+                srch_work.sx <= SRC_X[10:0];
+            end
+        end
+    end
+
+    /*******************************************
+     * STATUS.CE bit
+     *******************************************/
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                                    STATUS.CE <= 0; // RESET
+        else if(!CLK_EN)                                ;               // タイミング外
+        else if(START && REG.OP != T9990_REG::CMD_STOP) STATUS.CE <= 1; // コマンド実行開始
+        else if(command_is_complete)                    STATUS.CE <= 0; // コマンド実行完了
+    end
+
+    /*******************************************
+     * STATUS.CE_intr bit
+     *******************************************/
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                    STATUS.CE_intr <= 0;    // RESET
+        else if(!CLK_EN)                ;                       // タイミング外
+        else if(command_is_complete)    STATUS.CE_intr <= 1;    // コマンド実行完了
+        else                            STATUS.CE_intr <= 0;    // それ以外
+    end
+
+    /*******************************************
+     * FIFO クリアフラグ
+     *******************************************/
+    reg FIFO_CLEAR;     // FIFO クリアフラグ
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                    FIFO_CLEAR <= 1;    // RESET
+        else if(!CLK_EN)                ;                   // タイミング外
+        else if(!xfer_is_busy)          FIFO_CLEAR <= 1;    // 転送停止中
+        else                            FIFO_CLEAR <= 0;    // 転送中
+    end
+
+    /*******************************************
+     * 座標更新フラグ更新
+     *******************************************/
+    reg src_nx_over;        // SRC_NX 終端チェック
+    reg dst_nx_over;        // DST_NX 終端チェック
+    reg src_change_y;       // SRC_Y 移動フラグ
+    reg dst_change_y;       // DST_Y 移動フラグ
 
     wire [4:0] SRC_OUT_COUNT = SRC_COUNT;
     wire [4:0] SRC_POS_COUNT = SRC_COUNT;
     wire [4:0] DST_IN_COUNT = DST_COUNT;
     wire [4:0] DST_POS_COUNT = DST_COUNT;
-    wire [31:0] LOGOP = ((REG.LO[2'b00] ? (~src_data_le & ~DST_DATA) : 32'b0) |
-                         (REG.LO[2'b01] ? (~src_data_le &  DST_DATA) : 32'b0) |
-                         (REG.LO[2'b10] ? ( src_data_le & ~DST_DATA) : 32'b0) |
-                         (REG.LO[2'b11] ? ( src_data_le &  DST_DATA) : 32'b0));
-
-    typedef enum logic [5:0] {
-        STATE_IDLE,
-        STATE_STOP,
-        STATE_LINE,
-        STATE_LINE_LOOP,
-        STATE_LINE_CHECK,
-        STATE_LINE_NEXT_MI,
-        STATE_LINE_NEXT_MJ,
-        STATE_SEARCH,
-        STATE_SEARCH_LOOP,
-        STATE_SEARCH_CHECK,
-        STATE_SEARCH_NEXT,
-        STATE_SETUP,
-        STATE_SETUP2,
-        STATE_SETUP3,
-        STATE_SRC_IN,
-        STATE_SRC_READ_P1_EVEN_VRAM_WAIT_ACK,
-        STATE_SRC_READ_P1_EVEN_VRAM_WAIT_BUSY,
-        STATE_SRC_READ_P1_ODD_VRAM_WAIT_ACK,
-        STATE_SRC_READ_P1_ODD_VRAM_WAIT_BUSY,
-        STATE_SRC_READ_VRAM_WAIT_ACK,
-        STATE_SRC_READ_VRAM_WAIT_BUSY,
-        STATE_SRC_READ_VRAM_CONV_2N,
-        STATE_SRC_READ_VRAM_CONV_8C,
-        STATE_SRC_READ_CPU_WAIT_ACK,
-        STATE_SRC_READ_CPU_WAIT_BUSY,
-        STATE_SRC_READ_CPU_H_WAIT_ACK,
-        STATE_SRC_READ_CPU_H_WAIT_BUSY,
-        STATE_SRC_DECODE,
-        STATE_SRC_ENQUEUE_WAIT1,
-        STATE_SRC_ENQUEUE_WAIT2,
-        STATE_SRC_ENQUEUE_DONE,
-        STATE_SRC_DEQUEUE,
-        STATE_DST_READ_VRAM,
-        STATE_DST_READ_P1_EVEN_VRAM_WAIT_ACK,
-        STATE_DST_READ_P1_EVEN_VRAM_WAIT_BUSY,
-        STATE_DST_READ_P1_ODD_VRAM_WAIT_ACK,
-        STATE_DST_READ_P1_ODD_VRAM_WAIT_BUSY,
-        STATE_DST_READ_VRAM_WAIT_ACK,
-        STATE_DST_READ_VRAM_WAIT_BUSY,
-        STATE_SRC_DEQUEUE_DONE,
-        STATE_LOGOP,
-        STATE_DST_WRITE,
-        STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_ACK,
-        STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_BUSY,
-        STATE_DST_WRITE_P1_ODD_VRAM_WAIT_ACK,
-        STATE_DST_WRITE_VRAM_WAIT_ACK,
-        STATE_DST_WRITE_CPU_H_WAIT_ACK,
-        STATE_DST_WRITE_CPU_H_WAIT_BUSY,
-        STATE_DST_WRITE_CPU_WAIT_ACK,
-        STATE_DST_WRITE_WAIT,
-        STATE_COMPLETE
-    } state_t;
-localparam state_t STATE_DST_WRITE_P1_ODD_VRAM_WAIT_BUSY = STATE_DST_WRITE_WAIT;
-localparam state_t STATE_DST_WRITE_VRAM_WAIT_BUSY        = STATE_DST_WRITE_WAIT;
-localparam state_t STATE_DST_WRITE_CPU_WAIT_BUSY         = STATE_DST_WRITE_WAIT;
-
-    state_t state;
-
-    reg src_nx_over;
-    reg dst_nx_over;
-    reg src_change_x;
-    reg dst_change_x;
-    reg src_change_y;
-    reg dst_change_y;
 
     always_ff @(posedge CLK) begin
-        src_nx_over <= SRC_NX <= SRC_POS_COUNT;
-        dst_nx_over <= DST_NX <= DST_POS_COUNT;
-        src_change_x <= !(is_srch || is_line);
-        dst_change_x <= !(is_srch || is_line);
-        src_change_y <= !(is_srch || is_line) && SRC_NX <= SRC_POS_COUNT;
-        dst_change_y <= !(is_srch || is_line) && DST_NX <= DST_POS_COUNT;
+        src_nx_over <= SRC_NX <= SRC_POS_COUNT;    // SRC_NX が読み出し可能数以下なら終端
+        dst_nx_over <= DST_NX <= DST_POS_COUNT;    // DST_NX が書き込み可能数以下なら終端
+        src_change_y <= SRC_NX <= SRC_POS_COUNT;   // X 終端なら SY 移動
+        dst_change_y <= DST_NX <= DST_POS_COUNT;   // X 終端なら DY 移動
     end
 
+    /*******************************************
+     * DST_X, DST_Y, DST_NX, DST_NY 更新
+     *******************************************/
+    reg [1:0]  DST_CLRM;        // DST データビット幅
+    reg [18:0] DST_NX;          // DST 横幅(or 転送バイト数)
+    reg [11:0] DST_NY;          // DST 縦幅
+    reg [18:0] DST_X;           // DST X 座標(or アドレス)
+    reg [11:0] DST_Y;           // DST Y 座標
+    reg        DST_DIX;         // DST X 移動方向
+    reg        dst_is_linear;   // DST リニアアドレス転送フラグ
+    reg        dst_is_cpu;      // DST CPU 転送フラグ
+    reg        dst_is_xy;       // DST 矩形転送フラグ
+    reg        xfer_run;        // 転送中フラグ
+
     always_ff @(posedge CLK) begin
-        if(REG.DSPM[1]) begin
-            // bitmap mode
-            XIMM <= REG.XIMM;
-            P1 <= 0;
+        if(REG.OP == T9990_REG::CMD_BMLX || REG.OP == T9990_REG::CMD_BMLL) DST_CLRM <= T9990_REG::CLRM_8BPP;    // バイト単位で転送
+        else if(REG.DSPM[1])                                               DST_CLRM <= REG.CLRM;                // ピクセル単位で転送
+        else                                                               DST_CLRM <= T9990_REG::CLRM_4BPP;    // P1/P2 モード(4BPP)転送
+    end
+
+    wire dst_complete = dst_is_linear ? (DST_NX <= DST_POS_COUNT) : (DST_NY == 1'd1);
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n) begin
+            xfer_run <= 0;
         end
-        else if(REG.DSPM[0]) begin
-            // P2 mode
-            XIMM <= T9990_REG::XIMM_512;
-            P1 <= 0;
+        else if(!CLK_EN) begin
         end
-        else begin
-            // P1 mode
-            XIMM <= T9990_REG::XIMM_256;
-            P1 <= 1;
+        else if(REG.OP == T9990_REG::CMD_STOP) begin
+            if(io_free) begin
+                xfer_run <= 0;
+            end
+        end
+        else if(xfer_setup[0]) begin
+            xfer_run <= 1;
+
+            if(REG.OP == T9990_REG::CMD_BMLL) begin
+                // 転送バイト数
+                DST_NX <= REG.NA;
+                DST_NY <= 1'd1;
+            end
+            else if(REG.OP == T9990_REG::CMD_POINT || REG.OP == T9990_REG::CMD_PSET || REG.OP == T9990_REG::CMD_ADVN) begin
+                // 転送ドット数
+                DST_NX <= 1;
+                DST_NY <= 1;
+            end
+            else begin
+                // 転送ドット数
+                DST_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
+                DST_NY <= REG.NY;
+            end
+
+            if(REG.OP == T9990_REG::CMD_BMLX || REG.OP == T9990_REG::CMD_BMLL) begin
+                // 転送先アドレス
+                DST_X <= REG.DA;
+                DST_Y <= 0;
+                DST_DIX <= 0;
+                dst_is_linear <= 1;
+            end
+            else begin
+                // 転送先座標
+                DST_X <= REG.DX;
+                DST_Y <= REG.DY;
+                DST_DIX <= REG.DIX;
+                dst_is_linear <= 0;
+            end
+
+            dst_is_cpu <= (REG.OP == T9990_REG::CMD_LMCM) || (REG.OP == T9990_REG::CMD_POINT);
+            dst_is_xy  <= (REG.OP == T9990_REG::CMD_LMMC) || (REG.OP == T9990_REG::CMD_LMMV) || (REG.OP == T9990_REG::CMD_LMMM) || (REG.OP == T9990_REG::CMD_LINE) || (REG.OP == T9990_REG::CMD_PSET) || (REG.OP == T9990_REG::CMD_CMMC) || (REG.OP == T9990_REG::CMD_CMMK) || (REG.OP == T9990_REG::CMD_CMMM) || (REG.OP == T9990_REG::CMD_BMXL);
+        end
+        else if(cond_dst_write_done) begin
+            // 残り回数
+            if(dst_is_linear) begin
+                DST_NX <= DST_NX - DST_POS_COUNT;
+            end
+            else if(dst_nx_over) begin
+                DST_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
+                DST_NY <= DST_NY - 1'd1;
+            end
+            else begin
+                DST_NX <= DST_NX - DST_POS_COUNT;
+            end
+
+            // 終わりチェック
+            if(dst_complete) begin
+                xfer_run <= 0;
+            end
+
+            // 座標更新
+            if(command_is_line) begin
+                if(dst_complete) begin
+                    // マイナー移動
+                    if(line_dda_trig) begin
+                        if(REG.MAJ) DST_X <= REG.DIX ? (DST_X - 1'd1) : (DST_X + 1'd1);
+                        else        DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
+                    end
+
+                    // メジャー移動
+                    if(!REG.MAJ) DST_X <= REG.DIX ? (DST_X - 1'd1) : (DST_X + 1'd1);
+                    else         DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
+                end
+            end
+            else if(dst_is_linear) begin
+                DST_X <= DST_X + DST_POS_COUNT;
+            end
+            else if(dst_change_y) begin
+                DST_X <= REG.DX;
+                DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
+            end
+            else begin
+                DST_X <= DST_DIX ? (DST_X - DST_POS_COUNT) : (DST_X + DST_POS_COUNT);
+            end
         end
     end
 
-    always_ff @(posedge CLK) begin
-        // SRC_CLRM
-        if(REG.OP == T9990_REG::CMD_CMMM || REG.OP == T9990_REG::CMD_BMXL|| REG.OP == T9990_REG::CMD_BMLL) begin
-            // byte mode
-            SRC_CLRM <= T9990_REG::CLRM_8BPP;
-        end
-        else if(REG.DSPM[1]) begin
-            // bitmap mode
-            SRC_CLRM <= REG.CLRM;
-        end
-        else begin
-            // P1/P2 mode
-            SRC_CLRM <= T9990_REG::CLRM_4BPP;
-        end
-    end
+    /*******************************************
+     * SRC_X, SRC_Y, SRC_NX, SRC_NY 更新
+     *******************************************/
+    reg [1:0]  SRC_CLRM;        // SRC データビット幅
+    reg [18:0] SRC_NX;          // SRC 横幅(or 転送バイト数)
+    reg [11:0] SRC_NY;          // SRC 縦幅
+    reg [18:0] SRC_X;           // SRC X 座標(or アドレス)
+    reg [11:0] SRC_Y;           // SRC Y 座標
+    reg        SRC_DIX;         // SRC X 移動方向
+    reg        src_is_linear;   // SRC リニアアドレス転送フラグ
+    reg        src_is_cpu;      // SRC PORT#2フラグ
+    reg        src_is_rom;      // SRC ROMフラグ
+    reg        src_is_vdp;      // SRC VDP レジスタフラグ
+    reg        src_is_char;     // SRC ビットマップデコードフラグ
+    reg        src_is_xy;       // SRC 矩形転送フラグ
+    reg        src_enable;      // SRC 取得可フラグ
 
     always_ff @(posedge CLK) begin
-        // DST_CLRM
-        if(REG.OP == T9990_REG::CMD_BMLX || REG.OP == T9990_REG::CMD_BMLL) begin
-            // byte mode
-            DST_CLRM <= T9990_REG::CLRM_8BPP;
-        end
-        else if(REG.DSPM[1]) begin
-            // bitmap mode
-            DST_CLRM <= REG.CLRM;
-        end
-        else begin
-            // P1/P2 mode
-            DST_CLRM <= T9990_REG::CLRM_4BPP;
-        end
+        if(REG.OP == T9990_REG::CMD_CMMM || REG.OP == T9990_REG::CMD_BMXL|| REG.OP == T9990_REG::CMD_BMLL) SRC_CLRM <= T9990_REG::CLRM_8BPP;    // バイト単位で転送
+        else if(REG.DSPM[1])                                                                               SRC_CLRM <= REG.CLRM;                // ピクセル単位で転送
+        else                                                                                               SRC_CLRM <= T9990_REG::CLRM_4BPP;    // P1/P2 モード(4BPP)転送
     end
 
     always_ff @(posedge CLK or negedge RESET_n) begin
         if(!RESET_n) begin
-            P2_CPU_TO_VDP.REQ <= 0;
-            P2_VDP_TO_CPU.REQ <= 0;
-            STATUS.TR <= 0;
-            STATUS.CE <= 0;
-            STATUS.CE_intr <= 0;
-            state <= STATE_IDLE;
-            FIFO_CLEAR <= 0;
-            CMD_MEM.OE_n <= 1;
-            CMD_MEM.WE_n <= 1;
-            CMD_MEM.ADDR <= 0;
-            CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
+            src_enable <= 0;
         end
-
-        //
-        // STOP 書き込み時処理
-        //
-        else if(START && REG.OP == T9990_REG::CMD_STOP) begin
-            state <= STATE_STOP;
-            P2_CPU_TO_VDP.REQ <= 0;
-            P2_VDP_TO_CPU.REQ <= 0;
-            STATUS.TR <= 0;
-            STATUS.CE_intr <= 0;
-        end
-
-        //
-        // STOP コマンド: 転送が終了するまで待機
-        //
-        else if(state == STATE_STOP) begin
-            if(!P2_CPU_TO_VDP.ACK && !P2_VDP_TO_CPU.ACK) begin
-                STATUS.CE <= 0;
-                STATUS.CE_intr <= 0;
-                state <= STATE_IDLE;
-            end
-        end
-
-        //
-        // アイドル
-        //
-        else if(state == STATE_IDLE) begin
-            STATUS.CE_intr <= 0;
-
-            if(START) begin
-                FIFO_CLEAR <= 1;
-
-                STATUS.CE <= 1;
-
-                src_enable <= 1;
-
-                work.char.decode_data <= 0;
-                work.char.decode_count <= 0;
-
-                // SRC_NX, SRC_NY, DST_NX, DST_NY
-                if(REG.OP == T9990_REG::CMD_BMLL) begin
-                    // 転送バイト数
-                    SRC_NX <= REG.NA;
-                    SRC_NY <= 1'd1;
-                    DST_NX <= REG.NA;
-                    DST_NY <= 1'd1;
-                end
-                else if(REG.OP == T9990_REG::CMD_POINT || REG.OP == T9990_REG::CMD_PSET || REG.OP == T9990_REG::CMD_ADVN) begin
-                    // 転送ドット数
-                    SRC_NX <= 1;
-                    SRC_NY <= 1;
-                    DST_NX <= 1;
-                    DST_NY <= 1;
-                end
-                else begin
-                    // 転送ドット数
-                    SRC_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
-                    SRC_NY <= REG.NY;
-                    DST_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
-                    DST_NY <= REG.NY;
-                end
-
-                // SRC_X, SRC_Y, SRC_DIX
-                if(REG.OP == T9990_REG::CMD_CMMM || REG.OP == T9990_REG::CMD_BMXL || REG.OP == T9990_REG::CMD_BMLL) begin
-                    // 転送元アドレス
-                    SRC_X <= REG.SA;
-                    SRC_Y <= 0;
-                    SRC_DIX <= 0;
-                    src_is_linear <= 1;
-                end
-                else begin
-                    // 転送元座標
-                    SRC_X <= REG.SX;
-                    SRC_Y <= REG.SY;
-                    SRC_DIX <= REG.DIX;
-                    src_is_linear <= 0;
-                end
-
-                // DST_X, DST_Y, DST_DIX
-                if(REG.OP == T9990_REG::CMD_BMLX || REG.OP == T9990_REG::CMD_BMLL) begin
-                    // 転送先アドレス
-                    DST_X <= REG.DA;
-                    DST_Y <= 0;
-                    DST_DIX <= 0;
-                    dst_is_linear <= 1;
-                end
-                else begin
-                    // 転送先座標
-                    DST_X <= REG.DX;
-                    DST_Y <= REG.DY;
-                    DST_DIX <= REG.DIX;
-                    dst_is_linear <= 0;
-                end
-
-                //
-                src_is_cpu <= (REG.OP == T9990_REG::CMD_LMMC) || (REG.OP == T9990_REG::CMD_CMMC);
-                src_is_rom <= (REG.OP == T9990_REG::CMD_CMMK);
-                src_is_vdp <= (REG.OP == T9990_REG::CMD_LMMV) || (REG.OP == T9990_REG::CMD_LINE) || (REG.OP == T9990_REG::CMD_PSET) || (REG.OP == T9990_REG::CMD_ADVN);
-                src_is_char <= (REG.OP == T9990_REG::CMD_CMMC) || (REG.OP == T9990_REG::CMD_CMMK) || (REG.OP == T9990_REG::CMD_CMMM);
-                dst_is_cpu <= (REG.OP == T9990_REG::CMD_LMCM) || (REG.OP == T9990_REG::CMD_POINT);
-                src_is_xy <= (REG.OP == T9990_REG::CMD_LMCM) || (REG.OP == T9990_REG::CMD_LMMM) || (REG.OP == T9990_REG::CMD_BMLX) || (REG.OP == T9990_REG::CMD_SRCH) || (REG.OP == T9990_REG::CMD_POINT);
-                dst_is_xy <= (REG.OP == T9990_REG::CMD_LMMC) || (REG.OP == T9990_REG::CMD_LMMV) || (REG.OP == T9990_REG::CMD_LMMM) || (REG.OP == T9990_REG::CMD_LINE) || (REG.OP == T9990_REG::CMD_PSET) || (REG.OP == T9990_REG::CMD_CMMC) || (REG.OP == T9990_REG::CMD_CMMK) || (REG.OP == T9990_REG::CMD_CMMM) || (REG.OP == T9990_REG::CMD_BMXL);
-
-                //
-                is_line <= (REG.OP == T9990_REG::CMD_LINE);
-                is_srch <= (REG.OP == T9990_REG::CMD_SRCH);
-                is_point <= (REG.OP == T9990_REG::CMD_POINT);
-
-                // state
-                case (REG.OP)
-                    T9990_REG::CMD_LMMC:    state <= STATE_SETUP;
-                    T9990_REG::CMD_LMMV:    state <= STATE_SETUP;
-                    T9990_REG::CMD_LMCM:    state <= STATE_SETUP;
-                    T9990_REG::CMD_LMMM:    state <= STATE_SETUP;
-                    T9990_REG::CMD_CMMC:    state <= STATE_SETUP;
-                    T9990_REG::CMD_CMMK:    state <= STATE_SETUP;
-                    T9990_REG::CMD_CMMM:    state <= STATE_SETUP;
-                    T9990_REG::CMD_BMXL:    state <= STATE_SETUP;
-                    T9990_REG::CMD_BMLX:    state <= STATE_SETUP;
-                    T9990_REG::CMD_BMLL:    state <= STATE_SETUP;
-`ifdef ENABLE_LINE
-                    T9990_REG::CMD_LINE:    state <= STATE_LINE;
-`endif
-`ifdef ENABLE_SRCH
-                    T9990_REG::CMD_SRCH:    state <= STATE_SEARCH;
-`endif
-`ifdef ENABLE_POINT
-                    T9990_REG::CMD_POINT:   state <= STATE_SETUP;
-`endif
-`ifdef ENABLE_PSET
-                    T9990_REG::CMD_PSET:    state <= STATE_SETUP;
-`endif
-`ifdef ENABLE_ADVANCE
-                    T9990_REG::CMD_ADVN:    state <= STATE_SETUP;
-`endif
-                    default:                state <= STATE_STOP;
-                endcase
-            end
-        end
-
-        //
-        // 何もしない
-        //
         else if(!CLK_EN) begin
         end
-
-        //
-        // SRC_COUNT, BIT_MASK 計算
-        //
-        else if(state == STATE_SETUP) begin
-            FIFO_CLEAR <= 0;
-            state <= STATE_SETUP2;
-        end
-
-        //
-        // SRC_COUNT, BIT_MASK 確定
-        //
-        else if(state == STATE_SETUP2) begin
-            state <= STATE_SETUP3;
-        end
-
-        //
-        // ena_enqueue 確定
-        //
-        else if(state == STATE_SETUP3) begin
-            state <= STATE_SRC_IN;
-        end
-
-        //
-        // 転送元リード
-        //
-        else if(state == STATE_SRC_IN) begin
-            //
-            ENQUEUE_COUNT <= SRC_OUT_COUNT;
-
-            // キャラクタデータが残ってるならデコード
-            if(src_is_rom && work.char.decode_count != 0) begin
-                state <= STATE_SRC_DECODE;
+        else if(REG.OP == T9990_REG::CMD_STOP) begin
+            if(io_free) begin
+                src_enable <= 0;
             end
+        end
+        else if(xfer_setup[0]) begin
+            src_enable <= 1;
 
-            // 転送元データが必要なら読み出し開始
-            else if(ena_enqueue) begin
-                // VRAM リニア(P1モード)
-                if(P1 && src_is_linear) begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= {1'b0, SRC_X[18:2], 1'b0};          // 偶数アドレス(VRAM0)読み出し
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                    state <= STATE_SRC_READ_P1_EVEN_VRAM_WAIT_ACK;
-                end
-
-                // VRAM 矩形(P1モード)
-                //else if(P1 && src_is_xy) begin
-                //    CMD_MEM.OE_n <= 0;
-                //    CMD_MEM.ADDR <= {1'b0, SRC_XY_ADDR[18:2], 1'b0};    // 偶数アドレス(VRAM0)読み出し
-                //    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                //    state <= STATE_SRC_READ_P1_EVEN_VRAM_WAIT_ACK;
-                //end
-
-                // VRAM リニア
-                else if(src_is_linear) begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= {SRC_X[18:2], 2'b00};
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                    state <= STATE_SRC_READ_VRAM_WAIT_ACK;
-                end
-
-                // VRAM 矩形
-                else if(src_is_xy) begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= SRC_XY_ADDR;
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                    state <= STATE_SRC_READ_VRAM_WAIT_ACK;
-                end
-
-                // P#2
-                else if(src_is_cpu) begin
-                    P2_CPU_TO_VDP.REQ <= 1;
-                    STATUS.TR <= 1;
-                    state <= STATE_SRC_READ_CPU_WAIT_ACK;
-                end
-
-                // ROM
-                else if(src_is_rom) begin
-                    work.char.decode_data <= 0;
-                    work.char.decode_count <= 6'd32;
-                    state <= STATE_SRC_IN;  // ToDo: 漢字 ROM から読み出す
-                end
-
-                // VDP
-                else begin
-                    ENQUEUE_DATA <= {REG.FC,REG.FC};
-                    ENQUEUE <= 1;
-                    state <= STATE_SRC_ENQUEUE_WAIT1;
-                end
+            if(REG.OP == T9990_REG::CMD_BMLL) begin
+                // 転送バイト数
+                SRC_NX <= REG.NA;
+                SRC_NY <= 1'd1;
+            end
+            else if(REG.OP == T9990_REG::CMD_POINT || REG.OP == T9990_REG::CMD_PSET || REG.OP == T9990_REG::CMD_ADVN) begin
+                // 転送ドット数
+                SRC_NX <= 1;
+                SRC_NY <= 1;
             end
             else begin
-                state <= STATE_SRC_DEQUEUE;
+                // 転送ドット数
+                SRC_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
+                SRC_NY <= REG.NY;
             end
-        end
 
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_SRC_READ_P1_EVEN_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_SRC_READ_P1_EVEN_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し完了したら 奇数アドレスを読み出し
-        //
-        else if(state == STATE_SRC_READ_P1_EVEN_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                // 偶数アドレスデータを保存
-                save_mem_dout <= CMD_MEM.DOUT[15:0];
-
-                // VRAM リニア(P1モード)
-                //if(src_is_linear) begin
-                    CMD_MEM.ADDR <= {1'b1, SRC_X[18:2], 1'b0};          // 奇数アドレス(VRAM1)読み出し
-                //end
-                // VRAM 矩形(P1モード)
-                //else begin
-                //    CMD_MEM.ADDR <= {1'b1, SRC_XY_ADDR[18:2], 1'b0};    // 奇数アドレス(VRAM1)読み出し
-                //end
-
-                CMD_MEM.OE_n <= 0;
-                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                state <= STATE_SRC_READ_P1_ODD_VRAM_WAIT_ACK;
-            end
-        end
-
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_SRC_READ_P1_ODD_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_SRC_READ_P1_ODD_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_SRC_READ_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_SRC_READ_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し完了したらデータを並び替え
-        //
-        else if(state == STATE_SRC_READ_VRAM_WAIT_BUSY || state == STATE_SRC_READ_P1_ODD_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                if(src_is_char) begin
-                    state <= STATE_SRC_READ_VRAM_CONV_8C;
-                    ENQUEUE_DATA <= cmd_mem_dout_be;
-                end
-                else begin
-                    if(SRC_DIX) begin
-                        // ドットを左右反転して転送元 VRAM データを ENQUEUE_DATA に格納
-                        case (SRC_CLRM)
-                            T9990_REG::CLRM_2BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 1: 0], cmd_mem_dout_be[ 3: 2], cmd_mem_dout_be[ 5: 4], cmd_mem_dout_be[ 7: 6], cmd_mem_dout_be[ 9: 8], cmd_mem_dout_be[11:10], cmd_mem_dout_be[13:12], cmd_mem_dout_be[15:14], cmd_mem_dout_be[17:16], cmd_mem_dout_be[19:18], cmd_mem_dout_be[21:20], cmd_mem_dout_be[23:22], cmd_mem_dout_be[25:24], cmd_mem_dout_be[27:26], cmd_mem_dout_be[29:28], cmd_mem_dout_be[31:30]};
-                            T9990_REG::CLRM_4BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 3: 0], cmd_mem_dout_be[ 7: 4], cmd_mem_dout_be[11: 8], cmd_mem_dout_be[15:12], cmd_mem_dout_be[19:16], cmd_mem_dout_be[23:20], cmd_mem_dout_be[27:24], cmd_mem_dout_be[31:28]};
-                            T9990_REG::CLRM_8BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 7: 0], cmd_mem_dout_be[15: 8], cmd_mem_dout_be[23:16], cmd_mem_dout_be[31:24]};
-                            T9990_REG::CLRM_16BPP:  ENQUEUE_DATA <= {cmd_mem_dout_be[15: 0], cmd_mem_dout_be[31:16]};
-                        endcase
-                    end
-                    else begin
-                        // ドットを反転しないで転送元 VRAM データを ENQUEUE_DATA に格納
-                        ENQUEUE_DATA <= cmd_mem_dout_be;
-                    end
-
-                    state <= STATE_SRC_READ_VRAM_CONV_2N;
-                end
-
-                // ビットシフト量を計算
-                case ({SRC_DIX, SRC_CLRM})
-                    {1'b0, T9990_REG::CLRM_2BPP}:   ENQUEUE_SHIFT <=   SRC_X[3:0];
-                    {1'b0, T9990_REG::CLRM_4BPP}:   ENQUEUE_SHIFT <= { SRC_X[2:0], 1'b0};
-                    {1'b0, T9990_REG::CLRM_8BPP}:   ENQUEUE_SHIFT <= { SRC_X[1:0], 2'b00};
-                    {1'b0, T9990_REG::CLRM_16BPP}:  ENQUEUE_SHIFT <= { SRC_X[0:0], 3'b000};
-                    {1'b1, T9990_REG::CLRM_2BPP}:   ENQUEUE_SHIFT <=  ~SRC_X[3:0];
-                    {1'b1, T9990_REG::CLRM_4BPP}:   ENQUEUE_SHIFT <= {~SRC_X[2:0], 1'b0};
-                    {1'b1, T9990_REG::CLRM_8BPP}:   ENQUEUE_SHIFT <= {~SRC_X[1:0], 2'b00};
-                    {1'b1, T9990_REG::CLRM_16BPP}:  ENQUEUE_SHIFT <= {~SRC_X[0:0], 3'b000};
-                endcase
-            end
-        end
-
-        //
-        // ビットシフトしてから FIFO へ格納
-        //
-        else if(state == STATE_SRC_READ_VRAM_CONV_2N) begin
-            case (ENQUEUE_SHIFT)
-                4'd0:   ENQUEUE_DATA <= ENQUEUE_DATA;
-                4'd1:   ENQUEUE_DATA <= {ENQUEUE_DATA[29:0],  2'b0};
-                4'd2:   ENQUEUE_DATA <= {ENQUEUE_DATA[27:0],  4'b0};
-                4'd3:   ENQUEUE_DATA <= {ENQUEUE_DATA[25:0],  6'b0};
-                4'd4:   ENQUEUE_DATA <= {ENQUEUE_DATA[23:0],  8'b0};
-                4'd5:   ENQUEUE_DATA <= {ENQUEUE_DATA[21:0], 10'b0};
-                4'd6:   ENQUEUE_DATA <= {ENQUEUE_DATA[19:0], 12'b0};
-                4'd7:   ENQUEUE_DATA <= {ENQUEUE_DATA[17:0], 14'b0};
-                4'd8:   ENQUEUE_DATA <= {ENQUEUE_DATA[15:0], 16'b0};
-                4'd9:   ENQUEUE_DATA <= {ENQUEUE_DATA[13:0], 18'b0};
-                4'd10:  ENQUEUE_DATA <= {ENQUEUE_DATA[11:0], 20'b0};
-                4'd11:  ENQUEUE_DATA <= {ENQUEUE_DATA[ 9:0], 22'b0};
-                4'd12:  ENQUEUE_DATA <= {ENQUEUE_DATA[ 7:0], 24'b0};
-                4'd13:  ENQUEUE_DATA <= {ENQUEUE_DATA[ 5:0], 26'b0};
-                4'd14:  ENQUEUE_DATA <= {ENQUEUE_DATA[ 3:0], 28'b0};
-                4'd15:  ENQUEUE_DATA <= {ENQUEUE_DATA[ 1:0], 30'b0};
-            endcase
-
-            ENQUEUE <= 1;
-            state <= STATE_SRC_ENQUEUE_WAIT1;
-        end
-
-        //
-        // データを順方向に並び替えて デコード
-        //
-        else if(state == STATE_SRC_READ_VRAM_CONV_8C) begin
-            case (SRC_X[1:0])
-                2'd0:   work.char.decode_data <= ENQUEUE_DATA;
-                2'd1:   work.char.decode_data <= {ENQUEUE_DATA[23:0],  8'b0};
-                2'd2:   work.char.decode_data <= {ENQUEUE_DATA[15:0], 16'b0};
-                2'd3:   work.char.decode_data <= {ENQUEUE_DATA[ 7:0], 24'b0};
-            endcase
-            work.char.decode_count <= {SRC_OUT_COUNT[2:0], 3'b000};
-            state <= STATE_SRC_DECODE;
-        end
-
-        //
-        // P2 にデータが書き込まれるまで待つ
-        //
-        else if(state == STATE_SRC_READ_CPU_WAIT_ACK) begin
-            if(P2_CPU_TO_VDP.ACK) begin
-                P2_CPU_TO_VDP.REQ <= 0;
-                STATUS.TR <= 0;
-                state <= STATE_SRC_READ_CPU_WAIT_BUSY;
-            end
-        end
-
-        //
-        // P2 がアイドルになったら、FIFO に格納
-        //
-        else if(state == STATE_SRC_READ_CPU_WAIT_BUSY) begin
-            if(!P2_CPU_TO_VDP.ACK) begin
-                if(src_is_char) begin
-                    work.char.decode_data <= {P2_CPU_TO_VDP.DATA, 24'b0};
-                    work.char.decode_count <= 6'd8;
-                    state <= STATE_SRC_DECODE;
-                end
-                else if(SRC_CLRM == T9990_REG::CLRM_16BPP) begin
-                    ENQUEUE_DATA <= {8'b0, P2_CPU_TO_VDP.DATA, 16'b0};
-                    P2_CPU_TO_VDP.REQ <= 1;
-                    STATUS.TR <= 1;
-                    state <= STATE_SRC_READ_CPU_H_WAIT_ACK;
-                end
-                else begin
-                    ENQUEUE_DATA <= {P2_CPU_TO_VDP.DATA, 24'b0};
-                    ENQUEUE <= 1;
-                    state <= STATE_SRC_ENQUEUE_WAIT1;
-                end
-            end
-        end
-
-        //
-        // P2 にデータが書き込まれるまで待つ
-        //
-        else if(state == STATE_SRC_READ_CPU_H_WAIT_ACK) begin
-            if(P2_CPU_TO_VDP.ACK) begin
-                P2_CPU_TO_VDP.REQ <= 0;
-                STATUS.TR <= 0;
-                state <= STATE_SRC_READ_CPU_H_WAIT_BUSY;
-            end
-        end
-
-        //
-        // P2 がアイドルになったら、FIFO に格納
-        //
-        else if(state == STATE_SRC_READ_CPU_H_WAIT_BUSY) begin
-            if(!P2_CPU_TO_VDP.ACK) begin
-                ENQUEUE_DATA <= {P2_CPU_TO_VDP.DATA, ENQUEUE_DATA[23:0]};
-                ENQUEUE <= 1;
-                state <= STATE_SRC_ENQUEUE_WAIT1;
-            end
-        end
-
-        //
-        // キャラクタデータをデコード
-        //
-        else if(state == STATE_SRC_DECODE) begin
-            work.char.decode_count <= work.char.decode_count - 1'd1;
-
-            if(DST_CLRM == T9990_REG::CLRM_2BPP) begin
-                ENQUEUE_DATA <= {
-                                    work.char.decode_data[31] ? REG.FC[15:14] : REG.BC[15:14],
-                                    work.char.decode_data[30] ? REG.FC[13:12] : REG.BC[13:12],
-                                    work.char.decode_data[29] ? REG.FC[11:10] : REG.BC[11:10],
-                                    work.char.decode_data[28] ? REG.FC[ 9: 8] : REG.BC[ 9: 8],
-                                    work.char.decode_data[27] ? REG.FC[ 7: 6] : REG.BC[ 7: 6],
-                                    work.char.decode_data[26] ? REG.FC[ 5: 4] : REG.BC[ 5: 4],
-                                    work.char.decode_data[25] ? REG.FC[ 3: 2] : REG.BC[ 3: 2],
-                                    work.char.decode_data[24] ? REG.FC[ 1: 0] : REG.BC[ 1: 0],
-                                    work.char.decode_data[23] ? REG.FC[15:14] : REG.BC[15:14],
-                                    work.char.decode_data[22] ? REG.FC[13:12] : REG.BC[13:12],
-                                    work.char.decode_data[21] ? REG.FC[11:10] : REG.BC[11:10],
-                                    work.char.decode_data[20] ? REG.FC[ 9: 8] : REG.BC[ 9: 8],
-                                    work.char.decode_data[19] ? REG.FC[ 7: 6] : REG.BC[ 7: 6],
-                                    work.char.decode_data[18] ? REG.FC[ 5: 4] : REG.BC[ 5: 4],
-                                    work.char.decode_data[17] ? REG.FC[ 3: 2] : REG.BC[ 3: 2],
-                                    work.char.decode_data[16] ? REG.FC[ 1: 0] : REG.BC[ 1: 0]
-                                };
-                work.char.decode_data <= {work.char.decode_data[15:0], work.char.decode_data[31:16]};
-            end
-            else if(DST_CLRM == T9990_REG::CLRM_4BPP) begin
-                ENQUEUE_DATA <= {
-                                    work.char.decode_data[31] ? REG.FC[15:12] : REG.BC[15:12],
-                                    work.char.decode_data[30] ? REG.FC[11: 8] : REG.BC[11: 8],
-                                    work.char.decode_data[29] ? REG.FC[ 7: 4] : REG.BC[ 7: 4],
-                                    work.char.decode_data[28] ? REG.FC[ 3: 0] : REG.BC[ 3: 0],
-                                    work.char.decode_data[27] ? REG.FC[15:12] : REG.BC[15:12],
-                                    work.char.decode_data[26] ? REG.FC[11: 8] : REG.BC[11: 8],
-                                    work.char.decode_data[25] ? REG.FC[ 7: 4] : REG.BC[ 7: 4],
-                                    work.char.decode_data[24] ? REG.FC[ 3: 0] : REG.BC[ 3: 0]
-                                };
-                work.char.decode_data <= {work.char.decode_data[23:0], work.char.decode_data[31:24]};
-            end
-            else if(DST_CLRM == T9990_REG::CLRM_8BPP) begin
-                ENQUEUE_DATA <= {
-                                    work.char.decode_data[31] ? REG.FC[15: 8] : REG.BC[15: 8],
-                                    work.char.decode_data[30] ? REG.FC[ 7: 0] : REG.BC[ 7: 0],
-                                    work.char.decode_data[29] ? REG.FC[15: 8] : REG.BC[15: 8],
-                                    work.char.decode_data[28] ? REG.FC[ 7: 0] : REG.BC[ 7: 0]
-                                };
-                work.char.decode_data <= {work.char.decode_data[27:0], work.char.decode_data[31:28]};
+            if(REG.OP == T9990_REG::CMD_CMMM || REG.OP == T9990_REG::CMD_BMXL || REG.OP == T9990_REG::CMD_BMLL) begin
+                // 転送元アドレス
+                SRC_X <= REG.SA;
+                SRC_Y <= 0;
+                SRC_DIX <= 0;
+                src_is_linear <= 1;
             end
             else begin
-                ENQUEUE_DATA <= {
-                                    work.char.decode_data[31] ? REG.FC[15: 0] : REG.BC[15: 0],
-                                    work.char.decode_data[30] ? REG.FC[15: 0] : REG.BC[15: 0]
-                                };
-                work.char.decode_data <= {work.char.decode_data[29:0], work.char.decode_data[31:30]};
+                // 転送元座標
+                SRC_X <= REG.SX;
+                SRC_Y <= REG.SY;
+                SRC_DIX <= REG.DIX;
+                src_is_linear <= 0;
             end
 
-            case (DST_CLRM)
-                T9990_REG::CLRM_2BPP:  ENQUEUE_COUNT <= 5'd16;
-                T9990_REG::CLRM_4BPP:  ENQUEUE_COUNT <= 5'd8;
-                T9990_REG::CLRM_8BPP:  ENQUEUE_COUNT <= 5'd4;
-                T9990_REG::CLRM_16BPP: ENQUEUE_COUNT <= 5'd2;
-            endcase
-            ENQUEUE <= 1;
-            state <= STATE_SRC_ENQUEUE_WAIT1;
+            src_is_cpu  <= (REG.OP == T9990_REG::CMD_LMMC) || (REG.OP == T9990_REG::CMD_CMMC);
+            src_is_rom  <= (REG.OP == T9990_REG::CMD_CMMK);
+            src_is_vdp  <= (REG.OP == T9990_REG::CMD_LMMV) || (REG.OP == T9990_REG::CMD_LINE) || (REG.OP == T9990_REG::CMD_PSET) || (REG.OP == T9990_REG::CMD_ADVN);
+            src_is_char <= (REG.OP == T9990_REG::CMD_CMMC) || (REG.OP == T9990_REG::CMD_CMMK) || (REG.OP == T9990_REG::CMD_CMMM);
+            src_is_xy   <= (REG.OP == T9990_REG::CMD_LMCM) || (REG.OP == T9990_REG::CMD_LMMM) || (REG.OP == T9990_REG::CMD_BMLX) || (REG.OP == T9990_REG::CMD_SRCH) || (REG.OP == T9990_REG::CMD_POINT);
         end
-
-        //
-        // FIFO に格納待ち
-        //
-        else if(state == STATE_SRC_ENQUEUE_WAIT1) begin
-            ENQUEUE <= 0;
-            state <= STATE_SRC_ENQUEUE_WAIT2;
-        end
-
-        //
-        // FIFO に格納待ち
-        //
-        else if(state == STATE_SRC_ENQUEUE_WAIT2) begin
-            ENQUEUE <= 0;
-            state <= STATE_SRC_ENQUEUE_DONE;
-        end
-
-        //
-        // FIFO 格納が完了したので転送元座標の更新
-        //
-        else if(state == STATE_SRC_ENQUEUE_DONE) begin
-            ENQUEUE <= 0;
-
+        else if(cond_src_read_done) begin
             // 残り回数
             if(src_is_linear) begin
                 SRC_NX <= SRC_NX - SRC_POS_COUNT;
@@ -924,32 +534,240 @@ localparam state_t STATE_DST_WRITE_CPU_WAIT_BUSY         = STATE_DST_WRITE_WAIT;
                 SRC_X <= REG.SX;
                 SRC_Y <= REG.DIY ? (SRC_Y - 1'd1) : (SRC_Y + 1'd1);
             end
-            else if(src_change_x) begin
+            else begin
                 // 隣へ移動
                 SRC_X <= SRC_DIX ? (SRC_X - SRC_POS_COUNT) : (SRC_X + SRC_POS_COUNT);
             end
-
-            state <= STATE_SRC_DEQUEUE;
         end
+    end
 
-        //
-        // 出力データの準備
-        //
-        else if(state == STATE_SRC_DEQUEUE) begin
-            // 転送先側の VRAM データが必要かどうかをチェック
-            if(!(dst_is_linear || dst_is_xy))               req_dst_vram <= 0;  // VRAM に出力しない場合は必要なし
-            else if(BIT_MASK != 32'hFFFF_FFFF)              req_dst_vram <= 1;  // ビットマスクに抜けがある場合は必要
-            else if(REG.TP)                                 req_dst_vram <= 1;  // 透明色を使う場合は必要
-            else if(REG.LO != 4'b1100 && REG.LO != 4'b0011) req_dst_vram <= 1;  // ビット演算を行う場合は必要
-            else                                            req_dst_vram <= 0;  // それ以外は必要なし
+    /*******************************************
+     * SRC ADDRESS
+     *******************************************/
+    reg [18:0] SRC_XY_ADDR;
+    T9990_BLIT_ADDR u_src_addr (
+        .CLK,
+        .CLRM(SRC_CLRM),
+        .P1,
+        .XIMM,
+        .X(SRC_X[10:0]),
+        .Y(SRC_Y),
+        .ADDR(SRC_XY_ADDR)
+    );
 
-            if(AVAIL_COUNT < DST_IN_COUNT) begin
-                // 出力のためのデータが足りないので FIFO 入力を繰り返す
-                state <= STATE_SETUP2;//state <= STATE_SRC_IN;
+    /*******************************************
+     * DST ADDRESS
+     *******************************************/
+    reg [18:0] DST_XY_ADDR;
+    T9990_BLIT_ADDR u_dst_addr (
+        .CLK,
+        .CLRM       (DST_CLRM),
+        .P1,
+        .XIMM,
+        .X          (DST_X[10:0]),
+        .Y          (DST_Y),
+        .ADDR       (DST_XY_ADDR)
+    );
+
+    /*******************************************
+     * SRC COUNT
+     *******************************************/
+    reg [4:0] SRC_COUNT;
+    T9990_BLIT_CALC_COUNT u_src_cnt (
+        .CLK,
+        .CPU_MODE   (src_is_cpu),
+        .IS_POINT   (is_point),
+        .CLRM       (SRC_CLRM),
+        .DIX        (SRC_DIX),
+        .OFFSET     (SRC_X[3:0]),
+        .REMAIN     (SRC_NX),
+        .COUNT      (SRC_COUNT)
+    );
+
+    /*******************************************
+     * DST COUNT
+     *******************************************/
+    reg [4:0] DST_COUNT;
+    T9990_BLIT_CALC_COUNT u_dst_cnt (
+        .CLK,
+        .CPU_MODE   (dst_is_cpu),
+        .IS_POINT   (is_point),
+        .CLRM       (DST_CLRM),
+        .DIX        (DST_DIX),
+        .OFFSET     (DST_X[3:0]),
+        .REMAIN     (DST_NX),
+        .COUNT      (DST_COUNT)
+    );
+
+    /*******************************************
+     * BIT MASK
+     *******************************************/
+    reg [31:0] BIT_MASK;
+    T9990_BLIT_BITMASK u_bitmsk (
+        .CLK,
+        .WM         (REG.WM),
+        .CLRM       (DST_CLRM),
+        .DIX        (DST_DIX),
+        .OFFSET     (DST_X[3:0]),
+        .COUNT      (DST_COUNT),
+        .BIT_MASK   (BIT_MASK)
+    );
+
+    /*******************************************
+     * ENQUEUE
+     *******************************************/
+    reg         ENQUEUE;
+    reg [3:0]   ENQUEUE_SHIFT;
+    reg [31:0]  ENQUEUE_DATA;
+    reg [4:0]   ENQUEUE_COUNT;
+
+    wire [31:0] cmd_mem_dout_p1_be  = { save_mem_dout[7:0], CMD_MEM.DOUT[7:0], save_mem_dout[15:8], CMD_MEM.DOUT[15:8]};    // 転送元 VRAM 読み出しデータ(P1モード、ビッグエンディアン)
+    wire [31:0] cmd_mem_dout_np1_be = { CMD_MEM.DOUT[7:0], CMD_MEM.DOUT[15:8], CMD_MEM.DOUT[23:16], CMD_MEM.DOUT[31:24]};   // 転送元 VRAM 読み出しデータ(ビッグエンディアン)
+    wire [31:0] cmd_mem_dout_be  = P1 ? cmd_mem_dout_p1_be : cmd_mem_dout_np1_be;                                           // 転送元 VRAM 読み出しデータ
+
+    reg ena_enqueue;
+    always_ff @(posedge CLK) if(CLK_EN) ena_enqueue <= FREE_COUNT >= SRC_OUT_COUNT && src_enable;   // SRC 取得可で FIFO バッファに空きがある場合に ENQUEUE 許可
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n) begin
+            ENQUEUE <= 0;
+        end
+        else if(!CLK_EN) begin
+        end
+        else if(REG.OP == T9990_REG::CMD_STOP) begin
+            if(io_free) begin
+                ENQUEUE <= 0;
             end
-            else begin
-                // FIFO から取り出し
+        end
+        else if(xfer_setup[0]) begin
+            ENQUEUE <= 0;
+            char_work.decode_data <= 0;
+            char_work.decode_count <= 0;
+        end
+        else begin
+            ENQUEUE <= cond_src_read_done;
+
+            if(cond_src_read_done) begin
+                //
+                if(src_is_char) begin
+                    ENQUEUE_COUNT <= 1;
+                end
+                else begin
+                    ENQUEUE_COUNT <= SRC_OUT_COUNT;
+                end
+
+                //
+                if(src_is_char) begin
+                    if(char_work.decode_count == 0) begin
+                        case (SRC_CLRM)
+                            T9990_REG::CLRM_2BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[31] ? REG.FC[15:14] :  2'd0, 30'd0};
+                            T9990_REG::CLRM_4BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[31] ? REG.FC[15:12] :  4'd0, 28'd0};
+                            T9990_REG::CLRM_8BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[31] ? REG.FC[15: 8] :  8'd0, 24'd0};
+                            T9990_REG::CLRM_16BPP:  ENQUEUE_DATA <=  cmd_mem_dout_be[31] ? REG.FC[15: 0] : 16'd0;
+                        endcase
+                        ENQUEUE_SHIFT <= 0;
+                        char_work.decode_data <= {cmd_mem_dout_be[30:24], cmd_mem_dout_be[31]};
+                        char_work.decode_count <= 3'd7;
+                    end
+                    else begin
+                        case (SRC_CLRM)
+                            T9990_REG::CLRM_2BPP:   ENQUEUE_DATA <= {char_work.decode_data[7] ? REG.FC[15:14] :  2'd0, 30'd0};
+                            T9990_REG::CLRM_4BPP:   ENQUEUE_DATA <= {char_work.decode_data[7] ? REG.FC[15:12] :  4'd0, 28'd0};
+                            T9990_REG::CLRM_8BPP:   ENQUEUE_DATA <= {char_work.decode_data[7] ? REG.FC[15: 8] :  8'd0, 24'd0};
+                            T9990_REG::CLRM_16BPP:  ENQUEUE_DATA <=  char_work.decode_data[7] ? REG.FC[15: 0] : 16'd0;
+                        endcase
+                        ENQUEUE_SHIFT <= 0;
+
+                        char_work.decode_data <= {char_work.decode_data[6:0], char_work.decode_data[7]};
+                        char_work.decode_count <= char_work.decode_count - 1'd1;
+                    end
+                end
+                else if(src_is_cpu) begin
+                    ENQUEUE_DATA <= cmd_mem_dout_be;
+                    ENQUEUE_SHIFT <= 0;
+                end
+                else if(src_is_vdp) begin
+                    ENQUEUE_DATA <= {REG.FC,REG.FC};
+                    ENQUEUE_SHIFT <= 0;
+                end
+                else begin
+                    if(SRC_DIX) begin
+                        // ドットを左右反転して転送元 VRAM データを ENQUEUE_DATA に格納
+                        case (SRC_CLRM)
+                            T9990_REG::CLRM_2BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 1: 0], cmd_mem_dout_be[ 3: 2], cmd_mem_dout_be[ 5: 4], cmd_mem_dout_be[ 7: 6], cmd_mem_dout_be[ 9: 8], cmd_mem_dout_be[11:10], cmd_mem_dout_be[13:12], cmd_mem_dout_be[15:14], cmd_mem_dout_be[17:16], cmd_mem_dout_be[19:18], cmd_mem_dout_be[21:20], cmd_mem_dout_be[23:22], cmd_mem_dout_be[25:24], cmd_mem_dout_be[27:26], cmd_mem_dout_be[29:28], cmd_mem_dout_be[31:30]};
+                            T9990_REG::CLRM_4BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 3: 0], cmd_mem_dout_be[ 7: 4], cmd_mem_dout_be[11: 8], cmd_mem_dout_be[15:12], cmd_mem_dout_be[19:16], cmd_mem_dout_be[23:20], cmd_mem_dout_be[27:24], cmd_mem_dout_be[31:28]};
+                            T9990_REG::CLRM_8BPP:   ENQUEUE_DATA <= {cmd_mem_dout_be[ 7: 0], cmd_mem_dout_be[15: 8], cmd_mem_dout_be[23:16], cmd_mem_dout_be[31:24]};
+                            T9990_REG::CLRM_16BPP:  ENQUEUE_DATA <= {cmd_mem_dout_be[15: 0], cmd_mem_dout_be[31:16]};
+                        endcase
+                    end
+                    else begin
+                        // ドットを反転しないで転送元 VRAM データを ENQUEUE_DATA に格納
+                        ENQUEUE_DATA <= cmd_mem_dout_be;
+                    end
+
+                    // ビットシフト量を計算
+                    case ({SRC_DIX, SRC_CLRM})
+                        {1'b0, T9990_REG::CLRM_2BPP}:   ENQUEUE_SHIFT <=   SRC_X[3:0];
+                        {1'b0, T9990_REG::CLRM_4BPP}:   ENQUEUE_SHIFT <= { SRC_X[2:0], 1'b0};
+                        {1'b0, T9990_REG::CLRM_8BPP}:   ENQUEUE_SHIFT <= { SRC_X[1:0], 2'b00};
+                        {1'b0, T9990_REG::CLRM_16BPP}:  ENQUEUE_SHIFT <= { SRC_X[0:0], 3'b000};
+                        {1'b1, T9990_REG::CLRM_2BPP}:   ENQUEUE_SHIFT <=  ~SRC_X[3:0];
+                        {1'b1, T9990_REG::CLRM_4BPP}:   ENQUEUE_SHIFT <= {~SRC_X[2:0], 1'b0};
+                        {1'b1, T9990_REG::CLRM_8BPP}:   ENQUEUE_SHIFT <= {~SRC_X[1:0], 2'b00};
+                        {1'b1, T9990_REG::CLRM_16BPP}:  ENQUEUE_SHIFT <= {~SRC_X[0:0], 3'b000};
+                    endcase
+                end
+            end
+        end
+    end
+
+    /*******************************************
+     * DEQUEUE SRC_DATA
+     *******************************************/
+    reg [31:0]  SRC_DATA;
+    reg         DEQUEUE;
+    reg [4:0]   DEQUEUE_COUNT;
+    reg [3:0]   DEQUEUE_SHIFT;
+    wire [31:0] DEQUEUE_DATA;
+
+    reg ena_dequeue;
+    always_ff @(posedge CLK) if(CLK_EN) ena_dequeue <= AVAIL_COUNT >= DST_IN_COUNT;     // FIFO に必要な数のデータがたまっているなら DEQUEUE 許可
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n) begin
+            DEQUEUE <= 0;
+        end
+        else if(!CLK_EN) begin
+        end
+        else if(REG.OP == T9990_REG::CMD_STOP) begin
+            if(io_free) begin
+                DEQUEUE <= 0;
+            end
+        end
+        else if(xfer_setup[0]) begin
+            DEQUEUE <= 0;
+        end
+        else begin
+            if(DEQUEUE) begin
+                // SRC DATA
+                if(DST_DIX) begin
+                    // 左右反転して SRC_DATA へ格納
+                    case (DST_CLRM)
+                        T9990_REG::CLRM_2BPP:   SRC_DATA <= {DEQUEUE_DATA[ 1: 0], DEQUEUE_DATA[ 3: 2], DEQUEUE_DATA[ 5: 4], DEQUEUE_DATA[ 7: 6], DEQUEUE_DATA[ 9: 8], DEQUEUE_DATA[11:10], DEQUEUE_DATA[13:12], DEQUEUE_DATA[15:14], DEQUEUE_DATA[17:16], DEQUEUE_DATA[19:18], DEQUEUE_DATA[21:20], DEQUEUE_DATA[23:22], DEQUEUE_DATA[25:24], DEQUEUE_DATA[27:26], DEQUEUE_DATA[29:28], DEQUEUE_DATA[31:30]};
+                        T9990_REG::CLRM_4BPP:   SRC_DATA <= {DEQUEUE_DATA[ 3: 0], DEQUEUE_DATA[ 7: 4], DEQUEUE_DATA[11: 8], DEQUEUE_DATA[15:12], DEQUEUE_DATA[19:16], DEQUEUE_DATA[23:20], DEQUEUE_DATA[27:24], DEQUEUE_DATA[31:28]};
+                        T9990_REG::CLRM_8BPP:   SRC_DATA <= {DEQUEUE_DATA[ 7: 0], DEQUEUE_DATA[15: 8], DEQUEUE_DATA[23:16], DEQUEUE_DATA[31:24]};
+                        T9990_REG::CLRM_16BPP:  SRC_DATA <= {DEQUEUE_DATA[15: 0], DEQUEUE_DATA[31:16]};
+                    endcase
+                end
+                else begin
+                    // 左右反転せずに SRC_DATA へ格納
+                    SRC_DATA <= DEQUEUE_DATA;
+                end
+            end
+
+            if(cond_src_dequeue_req) begin
                 DEQUEUE_COUNT <= DST_IN_COUNT;
+
                 case ({DST_DIX, DST_CLRM})
                     {1'b0, T9990_REG::CLRM_2BPP}:  DEQUEUE_SHIFT <=   DST_X[3:0];
                     {1'b0, T9990_REG::CLRM_4BPP}:  DEQUEUE_SHIFT <= { DST_X[2:0], 1'b0};
@@ -960,148 +778,66 @@ localparam state_t STATE_DST_WRITE_CPU_WAIT_BUSY         = STATE_DST_WRITE_WAIT;
                     {1'b1, T9990_REG::CLRM_8BPP}:  DEQUEUE_SHIFT <= {~DST_X[1:0], 2'b0};
                     {1'b1, T9990_REG::CLRM_16BPP}: DEQUEUE_SHIFT <= {~DST_X[0:0], 3'b0};
                 endcase
-                DEQUEUE <= 1;
-                state <= STATE_DST_READ_VRAM;
             end
+
+            DEQUEUE <= cond_src_dequeue_req;
         end
+    end
 
-        //
-        // 転送先データのリード
-        //
-        else if(state == STATE_DST_READ_VRAM) begin
-            DEQUEUE <= 0;
+    /*******************************************
+     * FIFO buffer
+     *******************************************/
+    wire [5:0]  FREE_COUNT;
+    wire [5:0]  AVAIL_COUNT;
 
-            // DST 側の VRAM データが必要なら読み出し
-            if(req_dst_vram) begin
-                if(P1 && dst_is_linear) begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= {1'b0, DST_X[18:2], 1'b0};
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                    state <= STATE_DST_READ_P1_EVEN_VRAM_WAIT_ACK;
-                end
-                //else if(P1) begin
-                //    CMD_MEM.OE_n <= 0;
-                //    CMD_MEM.ADDR <= {1'b0, DST_XY_ADDR[18:2], 1'b0};
-                //    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                //    state <= STATE_DST_READ_P1_EVEN_VRAM_WAIT_ACK;
-                //end
-                else if(dst_is_linear) begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= {DST_X[18:2], 2'b00};
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                    state <= STATE_DST_READ_VRAM_WAIT_ACK;
-                end
-                else begin
-                    CMD_MEM.OE_n <= 0;
-                    CMD_MEM.ADDR <= DST_XY_ADDR;
-                    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                    state <= STATE_DST_READ_VRAM_WAIT_ACK;
-                end
-            end
-            else begin
-                DST_DATA <= 0;
-                state <= STATE_SRC_DEQUEUE_DONE;
-            end
+    T9990_BLIT_FIFO u_fifo (
+        .RESET_n,
+        .CLK,
+        .CLK_EN,
+        .CLRM           (SRC_CLRM),
+        .FREE_COUNT,
+        .AVAIL_COUNT,
+        .CLEAR          (FIFO_CLEAR),
+        .ENQUEUE,
+        .ENQUEUE_COUNT,
+//      .ENQUEUE_SHIFT,
+        .ENQUEUE_DATA,
+        .DEQUEUE,
+        .DEQUEUE_COUNT,
+        .DEQUEUE_SHIFT,
+        .DEQUEUE_DATA
+    );
+
+    /*******************************************
+     * WRT_DATA 生成許可制御
+     *******************************************/
+    reg ena_logop;
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                ena_logop <= 0;                     // RESET
+        else if(!CLK_EN)            ;                                   // タイミング外
+        else                        ena_logop <= cond_dst_read_done;    // DST 読み出し完了後に LOGOP 許可
+    end
+
+    /*******************************************
+     * WRT_DATA 生成(LOGOP)
+     *******************************************/
+    reg [31:0]  WRT_DATA;
+    reg [31:0]  DST_DATA;
+
+    wire [31:0] src_data_le = {SRC_DATA[7:0], SRC_DATA[15:8], SRC_DATA[23:16], SRC_DATA[31:24]};        // ロジカルオペレーション SRC データ(リトルエンディアン)
+    wire [31:0] bit_mask_le = {BIT_MASK[7:0], BIT_MASK[15:8], BIT_MASK[23:16], BIT_MASK[31:24]};        // ビットマスク(リトルエンディアン)
+    wire [31:0] masked_src_data_le = src_data_le & bit_mask_le;                                         // ビットマスク後の SRC データ(リトルエンディアン)
+
+    wire [31:0] LOGOP = ((REG.LO[2'b00] ? (~src_data_le & ~DST_DATA) : 32'b0) |
+                         (REG.LO[2'b01] ? (~src_data_le &  DST_DATA) : 32'b0) |
+                         (REG.LO[2'b10] ? ( src_data_le & ~DST_DATA) : 32'b0) |
+                         (REG.LO[2'b11] ? ( src_data_le &  DST_DATA) : 32'b0));
+
+    always_ff @(posedge CLK) begin
+        if(!CLK_EN) begin
         end
-
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_DST_READ_P1_EVEN_VRAM_WAIT_ACK) begin
-            DEQUEUE <= 0;
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_DST_READ_P1_EVEN_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し完了したら 奇数アドレス読み出し
-        //
-        else if(state == STATE_DST_READ_P1_EVEN_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                save_mem_dout <= CMD_MEM.DOUT[15:0];
-
-                //if(dst_is_linear) begin
-                    CMD_MEM.ADDR <= {1'b1, DST_X[18:2], 1'b0};
-                //end
-                //else begin
-                //    CMD_MEM.ADDR <= {1'b1, DST_XY_ADDR[18:2], 1'b0};
-                //end
-
-                CMD_MEM.OE_n <= 0;
-                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                state <= STATE_DST_READ_P1_ODD_VRAM_WAIT_ACK;
-            end
-        end
-
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_DST_READ_P1_ODD_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_DST_READ_P1_ODD_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し完了したら DST_DATA へ格納
-        //
-        else if(state == STATE_DST_READ_P1_ODD_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                // 偶数アドレスと奇数アドレスのデータを合成
-                DST_DATA <= {CMD_MEM.DOUT[15:8], save_mem_dout[15:8], CMD_MEM.DOUT[7:0], save_mem_dout[7:0]};
-                state <= STATE_SRC_DEQUEUE_DONE;
-            end
-        end
-
-        //
-        // VRAM 読み出し要求を受け付けるまで待つ
-        //
-        else if(state == STATE_DST_READ_VRAM_WAIT_ACK) begin
-            DEQUEUE <= 0;
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.OE_n <= 1;
-                state <= STATE_DST_READ_VRAM_WAIT_BUSY;
-            end
-        end
-
-        //
-        // VRAM 読み出し完了したら DST_DATA へ格納
-        //
-        else if(state == STATE_DST_READ_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                DST_DATA <= CMD_MEM.DOUT;
-                state <= STATE_SRC_DEQUEUE_DONE;
-            end
-        end
-
-        //
-        // FIFO から取り出したデータを加工
-        //
-        else if(state == STATE_SRC_DEQUEUE_DONE) begin
-            if(DST_DIX) begin
-                // 左右反転して SRC_DATA へ格納
-                case (DST_CLRM)
-                    T9990_REG::CLRM_2BPP:   SRC_DATA <= {DEQUEUE_DATA[ 1: 0], DEQUEUE_DATA[ 3: 2], DEQUEUE_DATA[ 5: 4], DEQUEUE_DATA[ 7: 6], DEQUEUE_DATA[ 9: 8], DEQUEUE_DATA[11:10], DEQUEUE_DATA[13:12], DEQUEUE_DATA[15:14], DEQUEUE_DATA[17:16], DEQUEUE_DATA[19:18], DEQUEUE_DATA[21:20], DEQUEUE_DATA[23:22], DEQUEUE_DATA[25:24], DEQUEUE_DATA[27:26], DEQUEUE_DATA[29:28], DEQUEUE_DATA[31:30]};
-                    T9990_REG::CLRM_4BPP:   SRC_DATA <= {DEQUEUE_DATA[ 3: 0], DEQUEUE_DATA[ 7: 4], DEQUEUE_DATA[11: 8], DEQUEUE_DATA[15:12], DEQUEUE_DATA[19:16], DEQUEUE_DATA[23:20], DEQUEUE_DATA[27:24], DEQUEUE_DATA[31:28]};
-                    T9990_REG::CLRM_8BPP:   SRC_DATA <= {DEQUEUE_DATA[ 7: 0], DEQUEUE_DATA[15: 8], DEQUEUE_DATA[23:16], DEQUEUE_DATA[31:24]};
-                    T9990_REG::CLRM_16BPP:  SRC_DATA <= {DEQUEUE_DATA[15: 0], DEQUEUE_DATA[31:16]};
-                endcase
-            end
-            else begin
-                // 左右反転せずに SRC_DATA へ格納
-                SRC_DATA <= DEQUEUE_DATA;
-            end
-
-            state <= STATE_LOGOP;
-        end
-
-        //
-        // ロジカルオペレーション
-        //
-        else if(state == STATE_LOGOP) begin
+        else if(cond_logop) begin
             if(REG.TP) begin
                 // 1ドット毎に 0 と比較してライトデータを作成
                 if(DST_CLRM == T9990_REG::CLRM_2BPP) begin
@@ -1155,384 +891,234 @@ localparam state_t STATE_DST_WRITE_CPU_WAIT_BUSY         = STATE_DST_WRITE_WAIT;
                 // ライトデータを作成
                 WRT_DATA <= (LOGOP & bit_mask_le) | (DST_DATA & ~bit_mask_le);
             end
+        end
+    end
 
-            state <= STATE_DST_WRITE;
+    /*******************************************
+     * DST 出力許可制御
+     *******************************************/
+    reg ena_output;
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n)                 ena_output <= 0;   // RESET
+        else if(!CLK_EN)             ;                  // タイミング外
+        else if(cond_logop)          ena_output <= 1;   // LOGOP 実行したら出力許可
+        else if(cond_dst_write_done) ena_output <= 0;   // DST 書き込み完了したら出力禁止
+    end
+
+    /*******************************************
+     * DST データ取得が必要か？
+     *******************************************/
+    reg req_dst_vram;
+
+    always_ff @(posedge CLK) begin
+        if(!(dst_is_linear || dst_is_xy))               req_dst_vram <= 0;  // VRAM に出力しない場合は必要なし
+        else if(BIT_MASK != 32'hFFFF_FFFF)              req_dst_vram <= 1;  // ビットマスクに抜けがある場合は必要
+        else if(REG.TP)                                 req_dst_vram <= 1;  // 透明色を使う場合は必要
+        else if(REG.LO != 4'b1100 && REG.LO != 4'b0011) req_dst_vram <= 1;  // ビット演算を行う場合は必要
+        else                                            req_dst_vram <= 0;  // それ以外は必要なし
+    end
+
+    /*******************************************
+     * データの入出力
+     *******************************************/
+    // CHAR 用ワーク構造体
+    struct {
+        reg [5:0] decode_count;
+        reg [31:0] decode_data;
+    } char_work;
+
+    reg  io_req;                                        // I/O 要求中フラグ
+    wire io_ack = CMD_MEM.BUSY || P2_VDP_TO_CPU.ACK;    // I/O 要求受付フラグ
+    reg  p1_even;                                       // P1 偶数/奇数
+    wire io_free = !io_req && !io_ack &&                // I/O 空きフラグ
+                   !cond_dst_write_req &&
+                   !cond_dst_write_even_done &&
+                   !cond_dst_read_req &&
+                   !cond_dst_read_even_done &&
+                   !cond_src_read_req &&
+                   !cond_src_read_even_done;
+
+    reg [15:0] save_mem_dout;                           // P1 モード VRAM0 データ一時保存用
+
+    always_ff @(posedge CLK or negedge RESET_n) begin
+        if(!RESET_n) begin
+            io_req <= 0;
+            CMD_MEM.OE_n <= 1;
+            CMD_MEM.WE_n <= 1;
+        end
+        else if(!CLK_EN) begin
         end
 
         //
-        // データ書き込み
+        // OUT WRT_DATA
         //
-        else if(state == STATE_DST_WRITE) begin
+        else if(cond_dst_write_req) begin
+            io_req <= 1;
+
+            // VRAM リニア(P1)
             if(P1 && dst_is_linear) begin
+                p1_even <= 1;
                 CMD_MEM.WE_n <= 0;
                 CMD_MEM.ADDR <= { 1'b0, DST_X[18:2], 1'b0};         // 偶数アドレス(VRAM0)書き込み
                 CMD_MEM.DIN <= {WRT_DATA[23:16], WRT_DATA[7:0], WRT_DATA[23:16], WRT_DATA[7:0]};
                 CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                state <= STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_ACK;
             end
-            //else if(P1 && dst_is_xy) begin
-            //    CMD_MEM.WE_n <= 0;
-            //    CMD_MEM.ADDR <= { 1'b0, DST_XY_ADDR[18:2], 1'b0}; // 偶数アドレス(VRAM0)書き込み
-            //    CMD_MEM.DIN <= {WRT_DATA[23:16], WRT_DATA[7:0], WRT_DATA[23:16], WRT_DATA[7:0]};
-            //    CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-            //    state <= STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_ACK;
-            //end
+
+            // VRAM リニア
             else if(dst_is_linear) begin
+                p1_even <= 0;
                 CMD_MEM.WE_n <= 0;
                 CMD_MEM.ADDR <= {DST_X[18:2], 2'b00};
                 CMD_MEM.DIN <= WRT_DATA;
                 CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                state <= STATE_DST_WRITE_VRAM_WAIT_ACK;
             end
+
+            // VRAM 矩形
             else if(dst_is_xy) begin
+                p1_even <= 0;
                 CMD_MEM.WE_n <= 0;
                 CMD_MEM.ADDR <= DST_XY_ADDR;
                 CMD_MEM.DIN <= WRT_DATA;
                 CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
-                state <= STATE_DST_WRITE_VRAM_WAIT_ACK;
             end
+
+            // P#2
             else if(dst_is_cpu) begin
+                p1_even <= 0;
                 P2_VDP_TO_CPU.REQ <= 1;
                 STATUS.TR <= 1;
                 if(DST_CLRM == T9990_REG::CLRM_16BPP) begin
                     P2_VDP_TO_CPU.DATA <= WRT_DATA[23:16];
-                    state <= STATE_DST_WRITE_CPU_H_WAIT_ACK;
                 end
                 else begin
                     P2_VDP_TO_CPU.DATA <= WRT_DATA[31:24];
-                    state <= STATE_DST_WRITE_CPU_WAIT_ACK;
                 end
             end
-            else begin
-                state <= STATE_DST_WRITE_CPU_WAIT_BUSY;
-            end
+        end
+        else if(cond_dst_write_even_done) begin
+            p1_even <= 0;
+            CMD_MEM.WE_n <= 0;
+            CMD_MEM.ADDR <= { 1'b1, DST_X[18:2], 1'b0};         // 偶数アドレス(VRAM0)書き込み
+            CMD_MEM.DIN <= {WRT_DATA[31:24], WRT_DATA[15:8], WRT_DATA[31:24], WRT_DATA[15:8]};
+            CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
+        end
+        else if(cond_dst_write_done) begin
+            io_req <= 0;
         end
 
         //
-        // VRAM 書き込み要求を受け付けるまで待つ
+        // INPUT DST_DATA
         //
-        else if(state == STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.WE_n <= 1;
-                state <= STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_BUSY;
-            end
-        end
+        else if(cond_dst_read_req) begin
+            io_req <= 1;
 
-        //
-        // VRAM 書き込み完了したら 奇数を書き込み
-        //
-        else if(state == STATE_DST_WRITE_P1_EVEN_VRAM_WAIT_BUSY) begin
-            if(!CMD_MEM.BUSY) begin
-                //if(dst_is_linear) begin
-                    CMD_MEM.ADDR <= { 1'b1, DST_X[18:2], 1'b0};         // 奇数アドレス(VRAM1)書き込み
-                //end
-                //else begin
-                //    CMD_MEM.ADDR <= { 1'b1, DST_XY_ADDR[18:2], 1'b0}; // 奇数アドレス(VRAM1)書き込み
-                //end
-                CMD_MEM.DIN <= {WRT_DATA[31:24], WRT_DATA[15:8], WRT_DATA[31:24], WRT_DATA[15:8]};
-                CMD_MEM.WE_n <= 0;
+            // DST 側の VRAM データが必要なら読み出し
+            if(!req_dst_vram) begin
+                p1_even <= 0;
+            end
+
+            // VRAM リニア(P1)
+            else if(P1 && dst_is_linear) begin
+                p1_even <= 1;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= {1'b0, DST_X[18:2], 1'b0};
                 CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
-                state <= STATE_DST_WRITE_P1_ODD_VRAM_WAIT_ACK;
             end
+
+            // VRAM リニア
+            else if(dst_is_linear) begin
+                p1_even <= 0;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= {DST_X[18:2], 2'b00};
+                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
+            end
+
+            // VRAM 矩形
+            else begin
+                p1_even <= 0;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= DST_XY_ADDR;
+                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
+            end
+        end
+        else if(cond_dst_read_even_done) begin
+            save_mem_dout <= CMD_MEM.DOUT[15:0];
+            p1_even <= 0;
+            CMD_MEM.OE_n <= 0;
+            CMD_MEM.ADDR <= {1'b1, DST_X[18:2], 1'b0};
+            CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
+        end
+        else if(cond_dst_read_done) begin
+            io_req <= 0;
+            DST_DATA <= CMD_MEM.DOUT;
         end
 
         //
-        // VRAM 書き込み要求を受け付けるまで待つ
+        // INPUT SRC
         //
-        else if(state == STATE_DST_WRITE_P1_ODD_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.WE_n <= 1;
-                state <= STATE_DST_WRITE_P1_ODD_VRAM_WAIT_BUSY;
-            end
-        end
+        else if(cond_src_read_req) begin
+            io_req <= 1;
 
-        //
-        // VRAM 書き込み要求を受け付けるまで待つ
-        //
-        else if(state == STATE_DST_WRITE_VRAM_WAIT_ACK) begin
-            if(CMD_MEM.BUSY) begin
-                CMD_MEM.WE_n <= 1;
-                state <= STATE_DST_WRITE_VRAM_WAIT_BUSY;
+            // CHAR
+            if(src_is_char && char_work.decode_count != 0) begin
+                // データを読み込まずにデコードの続きをする
+                p1_even <= 0;
             end
-        end
 
-        //
-        // P2 にデータが上位データが書き込まれるまで待つ
-        //
-        else if(state == STATE_DST_WRITE_CPU_H_WAIT_ACK) begin
-            if(P2_VDP_TO_CPU.ACK) begin
-                P2_VDP_TO_CPU.REQ <= 0;
-                STATUS.TR <= 0;
-                state <= STATE_DST_WRITE_CPU_H_WAIT_BUSY;
+            // VRAM リニア(P1)
+            else if(P1 && src_is_linear) begin
+                p1_even <= 1;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= {1'b0, SRC_X[18:2], 1'b0};          // 偶数アドレス(VRAM0)読み出し
+                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
             end
-        end
 
-        //
-        // P2 がアイドルになるまで待つ
-        //
-        else if(state == STATE_DST_WRITE_CPU_H_WAIT_BUSY) begin
-            if(!P2_VDP_TO_CPU.ACK) begin
-                P2_VDP_TO_CPU.REQ <= 1;
-                P2_VDP_TO_CPU.DATA <= WRT_DATA[31:24];
+            // VRAM リニア
+            else if(src_is_linear) begin
+                p1_even <= 0;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= {SRC_X[18:2], 2'b00};
+                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
+            end
+
+            // VRAM 矩形
+            else if(src_is_xy) begin
+                p1_even <= 0;
+                CMD_MEM.OE_n <= 0;
+                CMD_MEM.ADDR <= SRC_XY_ADDR;
+                CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_32;
+            end
+
+            // P#2
+            else if(src_is_cpu) begin
+                p1_even <= 0;
+                P2_CPU_TO_VDP.REQ <= 1;
                 STATUS.TR <= 1;
-                state <= STATE_DST_WRITE_CPU_WAIT_ACK;
             end
-        end
 
-        //
-        // P2 にデータが下位データが書き込まれるまで待つ
-        //
-        else if(state == STATE_DST_WRITE_CPU_WAIT_ACK) begin
-            if(P2_VDP_TO_CPU.ACK) begin
-                P2_VDP_TO_CPU.REQ <= 0;
-                STATUS.TR <= 0;
-                state <= STATE_DST_WRITE_CPU_WAIT_BUSY;
+            // ROM
+            else if(src_is_rom) begin
+                p1_even <= 0;
+                // ToDo: read ROM
             end
-        end
 
-        //
-        // VRAM 書き込み完了 or P2 がアイドル なら次へ
-        //
-        else if(state == STATE_DST_WRITE_WAIT) begin
-            if(!CMD_MEM.BUSY && !P2_VDP_TO_CPU.ACK) begin
-                // 残り回数
-                if(dst_is_linear) begin
-                    DST_NX <= DST_NX - DST_POS_COUNT;
-
-                    // 終わり?
-                    if(DST_NX <= DST_POS_COUNT) begin
-                        state <= STATE_COMPLETE;
-                    end
-                    else begin
-                        state <= STATE_SRC_IN;
-                    end
-                end
-                else if(dst_nx_over) begin
-                    DST_NX <= REG.NX == 0 ? 12'd2048 : REG.NX;
-                    DST_NY <= DST_NY - 1'd1;
-
-                    // 終わり?
-                    if(DST_NY == 1'd1) begin
-                        state <= STATE_COMPLETE;
-                    end
-                    else begin
-                        state <= STATE_SRC_IN;
-                    end
-                end
-                else begin
-                    DST_NX <= DST_NX - DST_POS_COUNT;
-                    state <= STATE_SRC_IN;
-                end
-
-                // 座標更新
-                if(dst_is_linear) begin
-                    DST_X <= DST_X + DST_POS_COUNT;
-                end
-                else if(dst_change_y) begin
-                    DST_X <= REG.DX;
-                    DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
-                end
-                else if(dst_change_x) begin
-                    DST_X <= DST_DIX ? (DST_X - DST_POS_COUNT) : (DST_X + DST_POS_COUNT);
-                end
-            end
-        end
-
-        else if(state == STATE_COMPLETE) begin
-`ifdef ENABLE_LINE
-            if(is_line) begin
-                state <= STATE_LINE_LOOP;
-            end
-            else
-`endif
-`ifdef ENABLE_SRCH
-            if(is_srch) begin
-                state <= STATE_SEARCH_LOOP;
-            end
-            else
-`endif
-            begin
-                //
-                // ToDo:PSET と ADVANCE の座標更新
-                //
-                STATUS.CE <= 0;
-                STATUS.CE_intr <= 1;
-                state <= STATE_IDLE;
-            end
-        end
-
-`ifdef ENABLE_LINE
-        //
-        // LINE
-        //
-        else if(state == STATE_LINE) begin
-            //
-            work.line.cnt <= REG.MJ;
-            work.line.sum <= REG.MJ - 1'd1;
-            SRC_DIX <= 0;
-            DST_DIX <= 0;
-
-            // PSET 実行
-            SRC_X <= DST_X;
-            SRC_Y <= DST_Y;
-            SRC_NX <= 1;
-            SRC_NY <= 1;
-            DST_NX <= 1;
-            DST_NY <= 1;
-            src_enable <= 1;
-            state <= STATE_SETUP;
-        end
-        else if(state == STATE_LINE_LOOP) begin
-            work.line.sum <= work.line.sum - REG.MI;
-            state <= STATE_LINE_CHECK;
-        end
-        else if(state == STATE_LINE_CHECK) begin
-            // 終わりチェック
-            work.line.cnt <= work.line.cnt - 1'd1;
-            if(work.line.cnt == 1'd1) begin
-                is_line <= 0;
-                state <= STATE_COMPLETE;
-            end
-            else if(work.line.sum[$bits(work.line.sum)-1]) begin
-                state <= STATE_LINE_NEXT_MI;
-            end
+            // VDP
             else begin
-                state <= STATE_LINE_NEXT_MJ;
+                p1_even <= 0;
+                // データの読み込みなし
             end
         end
-        else if(state == STATE_LINE_NEXT_MI) begin
-            work.line.sum <= work.line.sum + REG.MJ;
-
-            // マイナー軸移動
-            if(REG.MAJ) begin
-                DST_X <= REG.DIX ? (DST_X - 1'd1) : (DST_X + 1'd1);
-            end
-            else begin
-                DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
-            end
-            state <= STATE_LINE_NEXT_MJ;
+        else if(cond_src_read_even_done) begin
+            save_mem_dout <= CMD_MEM.DOUT[15:0];
+            p1_even <= 0;
+            CMD_MEM.OE_n <= 0;
+            CMD_MEM.ADDR <= {1'b1, SRC_X[18:2], 1'b0};          // 偶数アドレス(VRAM0)読み出し
+            CMD_MEM.DIN_SIZE <= RAM::DIN_SIZE_16;
         end
-        else if(state == STATE_LINE_NEXT_MJ) begin
-            // メジャー軸移動
-            if(REG.MAJ) begin
-                DST_Y <= REG.DIY ? (DST_Y - 1'd1) : (DST_Y + 1'd1);
-            end
-            else begin
-                DST_X <= REG.DIX ? (DST_X - 1'd1) : (DST_X + 1'd1);
-            end
-
-            // PSET 実行
-            SRC_X <= DST_X;
-            SRC_Y <= DST_Y;
-            SRC_NX <= 1;
-            SRC_NY <= 1;
-            DST_NX <= 1;
-            DST_NY <= 1;
-            src_enable <= 1;
-            state <= STATE_SETUP;
+        else if(cond_src_read_done) begin
+            io_req <= 0;
         end
-`endif
-`ifdef ENABLE_SRCH
-        //
-        // SEARCH
-        //
-        else if(state == STATE_SEARCH) begin
-            // フラグクリア
-            STATUS.BD <= 0;
-            SRC_DIX <= 0;
-            DST_DIX <= 0;
-
-            // POINT 実行
-            DST_X <= SRC_X;
-            DST_Y <= SRC_Y;
-            SRC_NX <= 1;
-            SRC_NY <= 1;
-            DST_NX <= 1;
-            DST_NY <= 1;
-            src_enable <= 1;
-            state <= STATE_SETUP;
-        end
-        else if(state == STATE_SEARCH_LOOP) begin
-            // ピクセルを比較
-            work.srch.clr_neq <= ((SRC_DATA ^ {REG.FC,REG.FC}) & BIT_MASK) != 32'd0;
-/*
-            case(DST_CLRM)
-                T9990_REG::CLRM_2BPP:   work.srch.clr_neq <= (WRT_DATA[15:14] ^ REG.FC[15:14]) != 2'b00;
-                T9990_REG::CLRM_4BPP:   work.srch.clr_neq <= (WRT_DATA[15:12] ^ REG.FC[15:12]) != 4'b0000;
-                T9990_REG::CLRM_8BPP:   work.srch.clr_neq <= (WRT_DATA[15: 8] ^ REG.FC[15: 8]) != 8'b0000_0000;
-                default:                work.srch.clr_neq <= (WRT_DATA[15: 0] ^ REG.FC[15: 0]) != 16'b0000_0000_0000_0000;
-            endcase
-*/
-            // 画面左端検出
-            case(XIMM)
-                T9990_REG::XIMM_256:    work.srch.edge_left <= SRC_X[ 7:0] == 0;
-                T9990_REG::XIMM_512:    work.srch.edge_left <= SRC_X[ 8:0] == 0;
-                T9990_REG::XIMM_1024:   work.srch.edge_left <= SRC_X[ 9:0] == 0;
-                default:                work.srch.edge_left <= SRC_X[10:0] == 0;
-            endcase
-            // 画面右端検出
-            case(XIMM)
-                T9990_REG::XIMM_256:    work.srch.edge_right <= SRC_X[ 7:0] ==  8'b1111_1111;
-                T9990_REG::XIMM_512:    work.srch.edge_right <= SRC_X[ 8:0] ==  9'b1_1111_1111;
-                T9990_REG::XIMM_1024:   work.srch.edge_right <= SRC_X[ 9:0] == 10'b11_1111_1111;
-                default:                work.srch.edge_right <= SRC_X[10:0] == 11'b111_1111_1111;
-            endcase
-
-            state <= STATE_SEARCH_CHECK;
-        end
-        else if(state == STATE_SEARCH_CHECK) begin
-            // ピクセルデータチェック
-            if(REG.NEQ == work.srch.clr_neq) begin
-                // 完了
-                STATUS.BD <= 1;
-                STATUS.BX <= SRC_X[10:0];
-                is_srch <= 0;
-                state <= STATE_COMPLETE;
-            end
-            else begin
-                state <= STATE_SEARCH_NEXT;
-            end
-        end
-        else if(state == STATE_SEARCH_NEXT) begin
-            SRC_NX <= 1;
-            SRC_NY <= 1;
-            DST_NX <= 1;
-            DST_NY <= 1;
-            src_enable <= 1;
-
-            // 隣へ移動
-            if(REG.DIX) begin
-                // 左端チェック
-                if(work.srch.edge_left) begin
-                    // 左端で終了
-                    is_srch <= 0;
-                    state <= STATE_COMPLETE;
-                end
-                else begin
-                    // 左へ移動
-                    SRC_X[10:0] <= SRC_X[10:0] - 1'd1;
-                    DST_X[10:0] <= SRC_X[10:0] - 1'd1;
-                    // POINT 実行
-                    state <= STATE_SETUP;
-                end
-            end
-            else begin
-                // 右端チェック
-                if(work.srch.edge_right) begin
-                    // 右端で終了
-                    is_srch <= 0;
-                    state <= STATE_COMPLETE;
-                end
-                else begin
-                    // 右へ移動
-                    SRC_X[10:0] <= SRC_X[10:0] + 1'd1;
-                    DST_X[10:0] <= SRC_X[10:0] + 1'd1;
-                    // POINT 実行
-                    state <= STATE_SETUP;
-                end
-            end
-        end
-`endif
     end
 endmodule
 
